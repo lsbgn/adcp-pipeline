@@ -1,0 +1,7 @@
+# Requiere Python 3.10 o superior.
+numpy
+scipy
+matplotlib
+pyproj
+shapely
+geopandas

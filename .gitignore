@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+out_*/
+salida_*/
+*.mat
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
