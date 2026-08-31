@@ -1,0 +1,7 @@
+* text=auto
+*.shp binary
+*.shx binary
+*.dbf binary
+*.prj binary
+*.mat binary
+*.png binary
