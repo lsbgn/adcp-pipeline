@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 out_*/
 salida_*/
+.vscode/
 *.mat
 *.shp
 *.shx
