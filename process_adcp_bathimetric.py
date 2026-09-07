@@ -2,14 +2,66 @@
 """
 process_adcp_bathimetric.py
 ================================================================================
-ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v5.0)
+ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.0)
 
 Builds a hydraulically consistent 1D bathymetric cross-section perpendicular
 to the mean flow, from a SonTek M9/S5 .mat file (RiverSurveyor Live export).
 
 Velocities are NOT exported. Only the bed profile and supporting QA artifacts.
 
-Changes vs v4 (this version):
+Changes vs v5 (this version):
+    * AFORO GROUPING. Repeated transects at the same section (the usual >=4 runs
+      alternating start bank) are detected and averaged into ONE profile.
+      Grouping requires same river+brazo, |dchainage| <= --group-tol (15 m,
+      measured along the section-normal), section axes parallel within
+      --group-angle-tol (25 deg), and TEMPORAL CONTIGUITY — an uninterrupted run
+      in time order, which is what separates a real aforo from a second visit
+      hours later at a different stage. [grupos] in the INI forces grouping by
+      hand. Averaging MERGES THE BEAM CLOUDS and runs build_profile once, rather
+      than averaging already-built profiles: every point is projected from its
+      own (E, N), so runs of different width, start bank and track combine with
+      no resampling. On a synthetic 4-run aforo this cut RMSE 0.046 -> 0.028 m.
+      Per-transect folders stay intact; campaign aggregates see only the group
+      profile. New <grupo>/ outputs plus _resumen/grupos_qc.csv (node sigma, per-run
+      RMS, chainage and azimuth spread, aforo discharge).
+    * DEPTH REFERENCE ported to the QRev model. --blend-beams / --vb-min give way
+      to --depth-ref {auto,vb,bt} (auto honours Setup.depthReference, i.e. the
+      field operator's choice), --composite {on,off}, --bt-avg {idw,simple},
+      --bt-geometry {footprints,ensemble} and --edge-anchor {ref,cloud}; the old
+      flags remain as aliases. Beam averaging is now INVERSE-RANGE WEIGHTED
+      (DepthData.average_depth): on a sloping bed the long beam looks downslope
+      and biases a plain mean deep. >=2 valid beams required. build_profile also
+      returns src_grid with the per-node QRev source code (1 BT, 2 VB, 3 DS,
+      4 interpolated). vb_priority generalises to 'the selected reference', so
+      --depth-ref vb reproduces v5 exactly.
+    * DEPTH SPIKE FILTER. v5 had NO outlier rejection. --depth-filter
+      {smooth,off} (default smooth) follows DepthData.filter_smooth: residuals
+      against a robust smooth, running IQR, rejection threshold = max(IQR
+      criterion, 5 % of depth, 0.10 m). Each beam filtered separately.
+    * SECTION AZIMUTH weighting. compute_flow_direction was already a vector sum;
+      it now weights each ensemble by interval x depth, giving the direction of
+      the section's TOTAL UNIT DISCHARGE VECTOR (--flow-weighting
+      {discharge,density,none}, default discharge; none = v5). Edge ensembles
+      (System.Step 2/4, boat stopped at the bank) are excluded from the azimuth
+      as QRev does; they stay in the cloud, since near-bank bed returns are
+      scarce and valuable — only their crowding weight is removed
+      (--density-weighting {on,off}, default on).
+    * SECTION-ORIENTATION QC. New section_orientation_qc plus
+      RiverNetwork.tangent_azimuth: track-vs-axis obliquity (and the % of width
+      lost, 1 - cos theta) and flow-normal vs trace-normal angle. The diagnostic
+      for "my sections don't look transversal". --section-orientation
+      {flow,centerline} stays on flow (v5 behaviour).
+    * AFORO DISCHARGE. The last value of Summary.Total_Q is the transect's
+      measured discharge (cross-checked against the sum of the five components).
+      survey_index.csv gains q_m3s; grupos_qc.csv gains mean, sd, CV, range and
+      per-run values; the repeatability plot title shows Q and its CV. USGS
+      practice is ~5 % per-transect spread about the mean. Independent of the
+      bathymetric repeatability — read the two separately.
+    * VERIFIED, NO CODE CHANGE: edge mapping (Edges_0 = LEFT always, regardless
+      of startEdge) and transducer draft (file depths already include it) were
+      both flagged as suspect and confirmed correct in v5.
+
+Changes vs v4 (inherited in v5):
     * MULTI-RIVER centerline (RiverNetwork, replaces RiverRoute). The centerline
       shapefile is now read as a NETWORK of channels: one feature per continuous
       river+role reach, with attributes `river` (Neuquen|Limay|Negro|...), `role`
@@ -3749,6 +3801,8 @@ def write_run_record(out_dir, args, campania, matfiles, extra_lines=None,
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
     p.add_argument("matfiles", nargs="*",
                    help="One or more .mat files, a folder of .mat files, or a glob. "
                         "Two or more transects triggers SURVEY mode. May instead be "

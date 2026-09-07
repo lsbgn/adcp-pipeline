@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic test for the v5 GIS layer (RiverNetwork / stations / water surface).
+"""Synthetic test for the GIS layer (RiverNetwork / stations / water surface).
 
 No .mat and no real multi-river shapefile are needed: we fabricate a small
 network in EPSG:5344-like planar metres —
@@ -24,7 +24,7 @@ import geopandas as gpd
 from shapely.geometry import LineString, Point
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import process_adcp_bathimetric_v5 as P
+import process_adcp_bathimetric as P
 
 CRS = "EPSG:5344"
 OK = True
@@ -80,6 +80,8 @@ def build_files(d: Path):
 
 
 def main():
+
+    print(f"=== test sintético — pipeline v{P.__version__} ===")
     tmp = Path(tempfile.mkdtemp())
     cl, stp, rd, cl0 = build_files(tmp)
 
@@ -228,7 +230,6 @@ def main():
 
     print("\n" + ("ALL PASS ✅" if OK else "SOME FAILED ❌"))
     return 0 if OK else 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
