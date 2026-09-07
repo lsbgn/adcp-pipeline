@@ -1,0 +1,4 @@
+station_id,name,river,X,Y,gauge_zero,chainage
+NEU-01,El Chanar,Neuquen,2600000.0,5720000.0,265.00,
+NEU-02,Senillosa,Neuquen,2615000.0,5700000.0,248.00,
+NEG-01,Paso Cordova,Negro,2645000.0,5685000.0,190.00,
