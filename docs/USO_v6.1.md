@@ -131,14 +131,21 @@ invertido. En QGIS hay dos formas de corregirlo:
 
 ## Cómo se ubica cada transecta
 
-1. La **línea de sección** es el eje principal de la traza GPS, prolongado un 15 % (mínimo 15 m) a cada lado.
-2. El río, el brazo y la progresiva salen del punto donde esa línea **cruza un eje**, como en HEC‑RAS. Si cruza varios, gana el cruce más cercano al centroide de la traza.
-3. Si no cruza ninguno (transecta parcial, eje desplazado), se usa el eje más cercano al centroide y queda un `[warn]`.
+El río, el brazo y la progresiva salen del punto donde la **sección cruza un
+eje**, como en HEC‑RAS.
 
-El criterio anterior, el eje más cercano al centroide, falla en las
-confluencias. Una sección sobre el Negro a pocos metros del nodo, con la traza
-cargada a una margen, tiene el centroide más cerca del final del eje del Limay.
-El log avisa cuando pasa:
+1. **La sección es la sección real**: el eje ⟂ al flujo medio sobre el que se arma el perfil, abarcando la extensión de la traza proyectada sobre él, prolongado un 15 % (mínimo 15 m) a cada lado. **No es la traza del bote.** En una confluencia el bote puede subir por un tributario y bajar por el otro mientras la sección que representa cruza sólo el cauce de aguas abajo.
+2. Si la sección cruza varios ejes, gana el cruce más cercano al centroide de la traza.
+3. Si no cruza ninguno, se prueba el eje principal de la traza (`loc_method = crossing-track`, con nota en el log).
+4. Si tampoco, se usa el eje más cercano al centroide (`nearest`, con `[warn]`).
+
+`loc_method`, en `survey_index.csv` y en el log, dice cuál de los cuatro casos
+se aplicó.
+
+El criterio de v6.0, el eje más cercano al centroide, falla en las confluencias:
+una sección sobre el Negro a pocos metros del nodo, con la traza cargada a una
+margen, tiene el centroide más cerca del final del eje del Limay. El log lo
+avisa:
 
 ```
 [info] 20260825145258: Negro km 0+005.00 (crossing) — nearest axis to the track centroid is Limay (64 m) — the crossing wins
@@ -147,10 +154,15 @@ El log avisa cuando pasa:
 Hay dos formas de intervenir:
 
 - `--transect-locate centroid` vuelve a la regla de v6.0, para reproducir progresivas viejas.
-- La sección `[rios]` del INI fuerza el río de una transecta puntual.
+- La sección `[rios]` del INI fuerza el río de una transecta puntual. Si la sección no cruza el eje de ese río, la progresiva sale de proyectar el centroide sobre él, y el log lo aclara.
 
-En transectas simétricas y perpendiculares al eje, cruce y centroide dan la
-misma progresiva. En trazas asimétricas u oblicuas pueden diferir algunos metros.
+En transectas simétricas y perpendiculares al eje, los tres criterios coinciden.
+Difieren en trazas curvas, asimétricas u oblicuas.
+
+El **pre-escaneo por GPS** que corre antes de procesar no conoce todavía la
+dirección del flujo, así que usa el eje de la traza. Su conteo por río es
+provisional y el log lo dice; cada transecta se reubica sobre su sección real
+al procesarse.
 
 ---
 
@@ -225,11 +237,12 @@ igual.
 | `--density-weighting` | `on`, `off` | `on` |
 | `--flow-weighting` | `discharge`, `density`, `none` | `discharge` |
 | `--use-edge-ensembles` | — | desactivado |
-| `--section-orientation` | `flow`, `centerline` | `flow` |
+| `--section-orientation` | `flow` | `flow` |
 | `--offset-scale` | metros | `3.0` |
 | `--no-offset-weighting` | — | — |
 
-`--flow-weighting none` reproduce el cálculo de v5.
+- `--flow-weighting none` reproduce el cálculo de v5.
+- `--section-orientation centerline` **no está implementada**. Ya era inerte en v6.0, donde además no avisaba; ahora emite un `[warn]`. El acimut de la sección siempre sale ⟂ al flujo medio.
 
 ### Agrupación de aforos
 
@@ -342,7 +355,15 @@ Ver `campanha_ejemplo_v6.ini`. Secciones reconocidas:
 - `[campanha]` (o `[campania]`, `[campaña]`): metadatos de trazabilidad.
 - `[procesamiento]`: cualquier flag, sin los guiones iniciales (`group-tol = 15`).
 - `[progresivas]`: offset de km oficial por río. El nombre se compara sin tildes ni mayúsculas contra el eje; uno que no coincide se avisa.
-- `[grupos]`: agrupación manual de aforos, `<nombre> = <id> <id> …`.
+- `[grupos]`: agrupación manual de aforos, `<nombre> = <id> <id> …`. Lo declarado acá sale del criterio automático, así que **un grupo de un solo miembro fija esa transecta como suelta** y sirve para deshacer una agrupación espuria:
+
+  ```ini
+  [grupos]
+  suelta_113623 = 20260825113623
+  suelta_113717 = 20260825113717
+  ```
+
+  El nombre del grupo es libre; un grupo de un miembro conserva el nombre original de la transecta.
 - `[rios]`: río forzado por transecta, `<id> = <río>`. Se avisa si el id no está entre las entradas o si el río no está en la red.
 
 Reglas:
@@ -425,6 +446,7 @@ Reglas:
 | punto GNSS `AMBIGUOUS` o en el río equivocado | punto en la confluencia o sobre un brazo de conexión | columna `rio`, o sacarlo del CSV |
 | escala `excluded` | sin `gauge_zero`, lejos del eje o fuera del tramo digitalizado | completar el registro o extender el eje |
 | `N transect(s) will get NO water surface` | río sin valores en ninguno de sus recorridos | revisar `water_surface_qc.csv` y la topología |
+| dos transectas distintas agrupadas como aforo | su diferencia de progresiva quedó bajo `group-tol`; sobre un brazo, la progresiva es la proyección en el cauce principal y comprime la separación real | revisar `grupo_repetibilidad.png`; si son distintas, declarar cada una como grupo de un miembro en `[grupos]` |
 | `unknown key` / `unknown section` en el INI | error de tipeo | corregir el nombre (`--help` lista las claves) |
 | `[progresivas] 'X' matches no river` | el nombre no coincide con el atributo `river` del eje | corregir el nombre |
 

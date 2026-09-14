@@ -17,7 +17,17 @@ Además, la transecta de la confluencia (20260825145258), cuya sección cruza el
 
 ### 1. Localización de transectas por cruce de sección
 
-El río y la progresiva de cada transecta salen del punto donde la **línea de sección cruza un eje**, como en HEC-RAS. La línea de sección es el eje principal de la traza GPS, prolongado un 15 % (mínimo 15 m) a cada lado. Si cruza varios ejes, gana el cruce más cercano al centroide. Si no cruza ninguno, se usa el eje más cercano al centroide y queda un `[warn]`.
+El río y la progresiva de cada transecta salen del punto donde la **línea de sección cruza un eje**, como en HEC-RAS.
+
+La línea de sección es la **sección real: el eje ⟂ al flujo sobre el que se arma el perfil**, con la extensión de la traza proyectada sobre él, prolongado un 15 % (mínimo 15 m) a cada lado. No es la traza del bote: en una confluencia el bote puede subir por un tributario y bajar por el otro mientras la sección que representa cruza sólo el cauce de aguas abajo.
+
+Orden de resolución:
+
+1. La sección ⟂ al flujo. Si cruza varios ejes, gana el cruce más cercano al centroide de la traza.
+2. Si no cruza ninguno, el eje principal de la traza (`loc_method = crossing-track`, con nota).
+3. Si tampoco, el eje más cercano al centroide (`nearest`, con `[warn]`).
+
+El pre-escaneo por GPS no conoce todavía la dirección del flujo, así que usa el eje de la traza y su conteo por río es **provisional**: cada transecta se reubica sobre su sección real al procesarse.
 
 - `transect-locate = centroid` reproduce la regla de v6.0.
 - La sección `[rios]` del INI fuerza el río de una transecta puntual.
@@ -77,7 +87,11 @@ El tramo bajo una confluencia pertenece a todos los recorridos que pasan por él
 - `procesamiento.log` guarda la consola completa, incluidos warnings de Python y traceback si la corrida se cae.
 - `procesamiento.txt` registra todos los parámetros efectivos, la red, los recorridos, el pelo de agua, cada `[warn]` y las advertencias QA de cada transecta.
 
-### 8. Correcciones menores
+### 8. `--section-orientation centerline` deja de ser silencioso
+
+La opción nunca estuvo implementada: `flow_direction_for` no lee `args.section_orientation`, y el acimut de la sección siempre sale ⟂ al flujo medio. En v6.0 elegirla no hacía nada y no avisaba. Ahora emite un `[warn]` y lo dice la ayuda. El comportamiento numérico no cambió.
+
+### 9. Correcciones menores
 
 - `format_progresiva` imprimía `1+1000.00` para 1999.999 m.
 - `survey_index.csv` se escribe con el módulo `csv`, porque las notas pueden contener comas.
@@ -122,6 +136,8 @@ Red sintética armada alrededor de los 40 puntos reales de `PA_20260825.csv`, co
 |---|---|
 | Río y km de las 15 salidas (13 simples + 2 aforos) | Río correcto en todas; \|Δkm\| ≤ 0.38 m |
 | Sección sobre el Negro 5 m bajo la confluencia, traza cargada a una margen | Centroide: Limay km 65+590.8 (el error real). Cruce: **Negro km 0+005** |
+| Traza que recorre ambos tributarios con sección ⟂ al flujo sobre el otro cauce | La sección manda sobre el eje de la traza; el respaldo se rotula `crossing-track` |
+| Regresión de la sección ⟂ al flujo sobre A y B | Profundidades, ríos, progresivas y pelo de agua idénticos a la corrida validada |
 | Cota de confluencia | Neuquén 254.604, Limay 254.526, adoptada 254.565 (Δ 0.078 m, PASS) |
 | Pelo de agua en Negro km 5 / 500 / 1200 / 2000 / 3800 | Igual al cálculo manual, al mm |
 | NEU-04 (control entre puntos GNSS) | −0.048 m, PASS |

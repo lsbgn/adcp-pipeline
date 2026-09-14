@@ -2042,20 +2042,28 @@ class RiverNetwork:
         out.sort(key=lambda d: d["dist"])
         return out
 
-    def locate_track(self, xs, ys, force_river=None, method="crossing"):
-        """Locate a TRANSECT from its track (6.1): river, brazo and chainage where
-        the SECTION LINE crosses a channel centerline (the HEC-RAS convention),
-        not the channel nearest to the track centroid.
+    def locate_track(self, xs, ys, force_river=None, method="crossing", section=None):
+        """Locate a TRANSECT: river, brazo and chainage where its SECTION LINE
+        crosses a channel centerline (the HEC-RAS convention), not the channel
+        nearest to the track centroid (6.1).
 
-        Near a confluence the nearest-centroid rule is unreliable: a section
-        across the Negro a few metres below the node, with a track covering
-        mostly one bank, has its centroid closer to the end of the Limay's line
-        and was reported as 'Limay'. The section line is the principal axis of
-        the track, extended by max(TRACK_LOC_MARGIN_MIN, FRAC x length) on each
-        side; if it crosses several channels the crossing nearest to the track
-        centroid wins. If it crosses none, or for method='centroid' (the v6.0
-        rule), the nearest axis to the centroid is used. `force_river` (the INI
-        [rios] override) restricts the search to that river.
+        `section` is the REAL section — the flow-perpendicular axis the profile
+        is built on — given as its two endpoints ((x0, y0), (x1, y1)) in the
+        network CRS, i.e. the extent of the track projected on that axis. That
+        is what must be intersected: a boat track can bend, wander, or run up
+        one tributary and down the other at a confluence while the section it
+        represents crosses only the channel downstream of the node. When
+        `section` is None (the GPS pre-scan, where the flow direction is not yet
+        known) the principal axis of the track is used and the result is
+        provisional.
+
+        Either line is extended by max(TRACK_LOC_MARGIN_MIN, FRAC x length) on
+        each side, so a track that stops short of the channel axis still crosses
+        it. If it crosses several channels the crossing nearest to the track
+        centroid wins. If the section crosses none, the track axis is tried,
+        and then the nearest axis to the centroid (method='nearest').
+        method='centroid' forces the v6.0 rule; `force_river` (the INI [rios]
+        override) restricts the search to that river.
 
         Returns dict(river, role, brazo, km_internal, km_oficial, dist, method,
         note); `dist` is the distance from the track centroid to the crossing."""
@@ -2080,18 +2088,35 @@ class RiverNetwork:
 
         if method == "centroid":
             return _fallback("centroid", "")
-        if x.size < 3:
+
+        def _extend(p0, p1):
+            """Segment p0-p1 extended by the margin on each side, or None."""
+            (x0, y0), (x1, y1) = p0, p1
+            dx, dy = x1 - x0, y1 - y0
+            L = math.hypot(dx, dy)
+            if not np.isfinite(L) or L < 1.0:
+                return None
+            ux, uy = dx / L, dy / L
+            m = max(TRACK_LOC_MARGIN_MIN, TRACK_LOC_MARGIN_FRAC * L)
+            return LineString([(x0 - m * ux, y0 - m * uy), (x1 + m * ux, y1 + m * uy)])
+
+        lines = []                                   # candidate lines, best first
+        if section is not None:
+            seg = _extend(section[0], section[1])
+            if seg is not None:
+                lines.append(("crossing", seg))
+        if x.size >= 3:
+            P = np.column_stack([x - cx, y - cy])
+            w, v = np.linalg.eigh(P.T @ P)
+            u = v[:, int(np.argmax(w))]
+            t = P @ u
+            lo, hi = float(t.min()), float(t.max())
+            seg = _extend((cx + lo * u[0], cy + lo * u[1]),
+                          (cx + hi * u[0], cy + hi * u[1]))
+            if seg is not None:
+                lines.append(("crossing" if section is None else "crossing-track", seg))
+        if not lines:
             return _fallback("nearest", "track too short for a section line")
-        P = np.column_stack([x - cx, y - cy])
-        w, v = np.linalg.eigh(P.T @ P)
-        u = v[:, int(np.argmax(w))]
-        t = P @ u
-        lo, hi = float(t.min()), float(t.max())
-        if hi - lo < 1.0:
-            return _fallback("nearest", "track too short for a section line")
-        m = max(TRACK_LOC_MARGIN_MIN, TRACK_LOC_MARGIN_FRAC * (hi - lo))
-        seg = LineString([(cx + (lo - m) * u[0], cy + (lo - m) * u[1]),
-                          (cx + (hi + m) * u[0], cy + (hi + m) * u[1])])
 
         def _points(g):
             if g is None or g.is_empty:
@@ -2104,35 +2129,43 @@ class RiverNetwork:
                 return [g.interpolate(0.5, normalized=True)]
             return []
 
-        cands = []
-        for ax in self.axes:
-            if force_river and ax.river != force_river:
-                continue
-            for g in [ax.main] + [ab["geom"] for ab in ax.anabranches]:
-                for q in _points(seg.intersection(g)):
-                    tq = (q.x - cx) * u[0] + (q.y - cy) * u[1]
-                    cands.append((abs(tq), ax.river, float(q.x), float(q.y)))
+        used, cands = None, []
+        for meth, seg in lines:
+            hits = []
+            for ax in self.axes:
+                if force_river and ax.river != force_river:
+                    continue
+                for g in [ax.main] + [ab["geom"] for ab in ax.anabranches]:
+                    for q in _points(seg.intersection(g)):
+                        hits.append((math.hypot(q.x - cx, q.y - cy), ax.river,
+                                     float(q.x), float(q.y)))
+            if hits:
+                used, cands = meth, sorted(hits, key=lambda c: c[0])
+                break
         if not cands:
             if force_river:
                 return _fallback("manual", f"forced to {force_river} ([rios]); the section "
                                            "does not cross its axis, km from the track "
                                            "centroid projected on it")
-            return _fallback("nearest", "the section line crosses no centerline — "
-                                        "nearest axis to the track centroid used")
-        cands.sort(key=lambda c: c[0])
+            return _fallback("nearest", "neither the section nor the track axis crosses a "
+                                        "centerline — nearest axis to the track centroid "
+                                        "used")
+
         d0, river, qx, qy = cands[0]
         km_i, brazo, role, _d = self._by_river[river].locate_local(qx, qy)
         notes = []
         others = sorted({c[1] for c in cands if c[1] != river})
         if others:
             notes.append("section also crosses " + ", ".join(others))
+        if used == "crossing-track":
+            notes.append("the flow-perpendicular section crosses no centerline — the "
+                         "track's principal axis was used")
         if not force_river and nearest["river"] != river:
             notes.append(f"nearest axis to the track centroid is {nearest['river']} "
                          f"({nearest['dist']:.0f} m) — the crossing wins")
         return dict(river=river, role=role, brazo=brazo, km_internal=float(km_i),
                     km_oficial=self.river_offsets.get(river, 0.0) + float(km_i),
-                    dist=float(d0), method=tag or "crossing", note="; ".join(notes))
-
+                    dist=float(d0), method=tag or used, note="; ".join(notes))
 
 def read_ws_csv(csv_path, east_col="East", north_col="North", elev_col="H_correg"):
     """Read a water-surface CSV -> list of (x, y, elevation) in the file's CRS."""
@@ -3781,9 +3814,16 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
         # the centroid (which put a Negro section below the confluence on the Limay)
         tr_c = Transformer.from_crs(utm_crs, network.crs, always_xy=True)
         tx, ty = tr_c.transform(utm[:, 0], utm[:, 1])
+        # the SECTION is the flow-perpendicular axis the profile is built on,
+        # spanning the track's projected extent — not the track itself
+        s_lo, s_hi = float(np.nanmin(s_track)), float(np.nanmax(s_track))
+        sec = tuple(zip(*tr_c.transform(
+            [Ec + s_lo * ux_LR, Ec + s_hi * ux_LR],
+            [Nc + s_lo * uy_LR, Nc + s_hi * uy_LR])))
         force = _manual_river(args, network, perfil_id, log)
         loc = network.locate_track(tx, ty, force_river=force,
-                                   method=getattr(args, "transect_locate", "crossing"))
+                                   method=getattr(args, "transect_locate", "crossing"),
+                                   section=sec)
         river = loc["river"]; role = loc["role"]; brazo = loc["brazo"]
         km_internal = loc["km_internal"]; progresiva_m = loc["km_oficial"]
         dist_axis = loc["dist"]; loc_method = loc["method"]; loc_note = loc["note"]
@@ -4197,9 +4237,15 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
             a, b = trm.transform(np.asarray(u)[:, 0], np.asarray(u)[:, 1])
             txs.append(np.asarray(a)); tys.append(np.asarray(b))
         if txs:
+            trc = Transformer.from_crs(ref["utm_crs"], network.crs, always_xy=True)
+            s_lo, s_hi = float(np.nanmin(s_pts)), float(np.nanmax(s_pts))
+            sec = tuple(zip(*trc.transform(
+                [Ec + s_lo * ux_LR, Ec + s_hi * ux_LR],
+                [Nc + s_lo * uy_LR, Nc + s_hi * uy_LR])))
             loc = network.locate_track(np.concatenate(txs), np.concatenate(tys),
                                        force_river=(river or None),
-                                       method=getattr(args, "transect_locate", "crossing"))
+                                       method=getattr(args, "transect_locate", "crossing"),
+                                       section=sec)
         else:
             tr_c = Transformer.from_crs(utm_crs, network.crs, always_xy=True)
             loc = network.locate(*tr_c.transform(centroid[0], centroid[1]))
@@ -4861,8 +4907,10 @@ def prescan_transects(matfiles, network, args=None, log: list | None = None):
         cnt = {}
         for t in out:
             cnt[t["river"]] = cnt.get(t["river"], 0) + 1
-        log.append("[info] transects per river (GPS pre-scan, located by "
-                   f"{method}): " + ", ".join(f"{k}: {v}" for k, v in cnt.items()))
+        log.append("[info] transects per river (GPS pre-scan on the track axis, "
+                   "PROVISIONAL — each transect is relocated on its real "
+                   "flow-perpendicular section when processed): "
+                   + ", ".join(f"{k}: {v}" for k, v in cnt.items()))
         for t in out:
             if t["note"] or t["method"] not in ("crossing", "centroid"):
                 tag = "[warn]" if t["method"] == "nearest" else "[info]"
@@ -5221,10 +5269,9 @@ def build_parser():
                         "flow-direction estimate. Off by default, as in QRev.")
     p.add_argument("--section-orientation", choices=["flow", "centerline"],
                    default="flow",
-                   help="Orient the section perpendicular to the mean flow (default, v5 "
-                        "behaviour) or to the river centerline at that chainage. The "
-                        "angle between the two is always reported as QA.")
-    # --- v6: repeated-transect (aforo) grouping ---
+                   help="Orient the section perpendicular to the mean flow (default). "
+                        "'centerline' is NOT IMPLEMENTED — inert since v6.0, it only "
+                        "logs a warning; the flow-perpendicular azimuth is always used.")
     p.add_argument("--no-group-repeats", action="store_true",
                    help="Disable aforo grouping and report every repetition as its own "
                         "profile (v5 behaviour).")
@@ -5528,6 +5575,12 @@ def _run(runlog):
 
     # --- 6.1: transects located from their GPS (section crossing), paths ranked
     # for display only — the water surface needs no trunk.
+    if str(getattr(args, "section_orientation", "flow")).lower() == "centerline":
+        setup_log.append(
+            "[warn] --section-orientation centerline is NOT implemented (it was "
+            "already inert in v6.0): the section azimuth is always taken "
+            "perpendicular to the mean flow. Remove the key or leave it at 'flow'.")
+
     prescan = []
     if network is not None:
         if args.manual_rivers:
