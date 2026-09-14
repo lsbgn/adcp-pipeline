@@ -64,7 +64,7 @@ corre igual pero no genera shapefiles ni progresivas.
 
 ## Documentación
 
-- [`docs/USO_v6.md`](docs/USO_v6.md) — uso, flags, entradas y salidas
+- [`docs/USO_v6.1.md`](docs/USO_v6.1.md) — uso, flags, entradas y salidas
 - [`docs/CAMBIOS_v6_vs_v5.md`](docs/CAMBIOS_v6_vs_v5.md) — cambios de v6
 - [`docs/CAMBIOS_v4_vs_v3.md`](docs/CAMBIOS_v4_vs_v3.md) — cambios de v4
 - [`docs/USO_v4.md`](docs/USO_v4.md) — referencia histórica

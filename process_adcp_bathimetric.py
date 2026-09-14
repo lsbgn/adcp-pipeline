@@ -2,14 +2,75 @@
 """
 process_adcp_bathimetric.py
 ================================================================================
-ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.0)
+ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.1)
 
 Builds a hydraulically consistent 1D bathymetric cross-section perpendicular
 to the mean flow, from a SonTek M9/S5 .mat file (RiverSurveyor Live export).
 
 Velocities are NOT exported. Only the bed profile and supporting QA artifacts.
 
-Changes vs v5 (this version):
+Changes in 6.1 (bug-fix release; numeric core untouched — build_profile,
+build_beam_cloud, flow direction and depth filters are identical to 6.0):
+    * NETWORK PATHS INSTEAD OF A TRUNK. v6.0 stitched the surveyed rivers into
+      ONE chain and interpolated the water surface on it. A survey touching two
+      tributaries of the same confluence (Neuquen + Limay) had two upstream
+      heads, the chain was undefined, every GNSS point was discarded and every
+      bed came out RELATIVE, silently (campaign 2026-08-25). The centerline is
+      now read as a NETWORK: each river's downstream end is linked to the river
+      it flows into, and each head-to-outlet PATH (Neuquen>Negro, Limay>Negro)
+      carries a continuous chainage. The reach below a confluence belongs to
+      every path through it, so no river has to be chosen as trunk.
+    * WATER SURFACE PER RIVER, MEETING AT THE CONFLUENCE (WaterSurfaceModel).
+      Each river keeps its own surface. The stage at a confluence is estimated
+      from EACH tributary with data (linear interpolation along its path
+      between its last value upstream and the first value downstream of the
+      node: its slope continued into the common river); the estimates are
+      averaged with weight 1/gap into one junction value and their spread is
+      QC'd against --ws-qc-tol. Anchors are the GNSS points plus the gauges
+      not bracketed by GNSS; bracketed gauges are QC only. Beyond the last
+      value of a path the surface is CONTINUED WITH ITS LOCAL SLOPE (least
+      squares over >= 1 km) instead of the flat v5/v6.0 clamp: a tributary
+      without data takes the junction stage and the slope of the common reach.
+      Extrapolations longer than --ws-extrap-tol are warnings. ws_source is one
+      of survey | bridge | station | extrap | none. _resumen/water_surface_qc.csv
+      lists every GNSS point, gauge and junction: river, km, distance to axis,
+      alternative river, role and reason.
+    * TRANSECTS LOCATED BY SECTION CROSSING. River and km are where the section
+      line (principal axis of the GPS track, extended 15 %) crosses a
+      centerline, as in HEC-RAS — not the axis nearest to the track centroid,
+      which put a Negro section a few metres below the confluence on the Limay.
+      --transect-locate centroid restores the v6.0 rule; the INI [rios] section
+      forces the river of a transect; an optional 'rio' column in the WS CSV
+      forces the river of a GNSS point (points with two candidate rivers are
+      flagged AMBIGUOUS).
+    * STATIONS. CSV registries (X/Y in --ws-crs) are read directly — pyogrio
+      returns a plain DataFrame for a CSV, which crashed with "'DataFrame' object
+      has no attribute 'crs'". A station is projected on its DECLARED river;
+      stations off axis, beyond the digitised reach or without gauge_zero are
+      excluded with the reason. Time-series readings are matched to the transect
+      time (representative_time now knows the SonTek 2000-01-01 epoch).
+    * NO SILENT RELATIVE OUTPUT. A transect without water surface logs a [warn]
+      and gets ws_source=none; if a water-surface source is configured and no
+      transect can get one, the run stops (--allow-relative to continue).
+    * CONFIG. The INI key schema is derived from the CLI parser: the v6 keys
+      (depth-ref, composite, bt-avg, group-tol, ...) were silently IGNORED in
+      campaign INIs. Choices are validated; unknown keys and sections are
+      warned; [progresivas] river names match the centerline accent- and
+      case-insensitively. ';' starts a comment in every section.
+    * RUN LOG. The whole console is saved to procesamiento.log; procesamiento.txt
+      records every effective parameter, the network / path / water-surface
+      setup, every [warn] and the QA warnings of each transect.
+    * FIXES. format_progresiva printed '1+1000.00' for 1999.999 m; survey_index
+      .csv is written with the csv module (notes may contain commas; the new
+      columns recorrido and loc_method are appended at the end); the section-
+      orientation QC uses the tangent of the transect's own river; the long
+      profile draws one panel per path.
+    * COMPATIBILITY. RiverNetwork.build_survey_chain / survey_chainage,
+      WaterSurfaceProfile and StationWS.elev_at are kept verbatim as legacy API
+      (no longer used by the pipeline). survey_chainage_m in survey_index.csv
+      is the continuous chainage along the transect's display path.
+
+Changes vs v5 (inherited in v6):
     * AFORO GROUPING. Repeated transects at the same section (the usual >=4 runs
       alternating start bank) are detected and averaged into ONE profile.
       Grouping requires same river+brazo, |dchainage| <= --group-tol (15 m,
@@ -123,20 +184,29 @@ Per-transect outputs (in ./out_<basename>/ or <survey>/<perfil>/):
     axis.shp / profile_points.shp / raw_beam_points.shp
 
 Extra survey-level outputs (multi-file mode), in <survey>/_resumen/:
-    survey_index.csv          one row per transect (progresiva, brazo, cotas, ancho…)
+    survey_index.csv          one row per transect / aforo group (river, km, brazo,
+                              cotas, ancho, ws_source, recorrido, loc_method)
     survey_profiles_all.csv   every gridded profile point of every transect
     survey_plan_view.png      centerline + all section axes, coloured by brazo
-    survey_long_profile.png   water surface + thalweg vs progresiva
-    survey_axes.shp / survey_profile_points.shp
+    survey_long_profile.png   water surface + thalweg, one panel per network path
+    survey_axes.shp / survey_profile_points.shp / survey_raw_beam_points.shp
+    grupos_qc.csv             repeatability and discharge of every aforo group
+    water_surface_qc.csv      every GNSS point, gauge and confluence stage: river,
+                              km, role (anchor / qc / dropped / excluded) and why
+    procesamiento.txt         traceability record (parameters, setup, warnings)
+    procesamiento.log         full console transcript of the run
 
 Usage:
+    # whole campaign from its INI (recommended; see campanha_ejemplo_v6.ini)
+    python process_adcp_bathimetric.py --config campanha.ini
+
     # single transect
-    python process_adcp_bathimetric_v4.py <input.mat> [--outdir <dir>]
-        [--centerline <river_axis.shp>] [--water-surface-csv <ws.csv>]
-        [--chainage-offset <m>] [--offset-scale <m>] [--no-offset-weighting]
+    python process_adcp_bathimetric.py <input.mat> [--outdir <dir>]
+        [--centerline <river_network.shp>] [--water-surface-csv <ws.csv>]
+        [--stations <estaciones.csv> --readings <niveles.csv>]
 
     # whole survey (folder of .mat, or several files)
-    python process_adcp_bathimetric_v4.py <survey_dir>/  --centerline <axis.shp>
+    python process_adcp_bathimetric.py <survey_dir>/  --centerline <network.shp>
         --water-surface-csv <ws.csv> [--survey-name <name>] [--outdir <dir>]
 
 Tested with: SonTek RiverSurveyor M9, .mat v5 export
@@ -146,14 +216,18 @@ Tested with: SonTek RiverSurveyor M9, .mat v5 export
 from __future__ import annotations
 
 import argparse
+import bisect
 import configparser
 import csv
 import datetime
 import glob
+import io
 import math
 import re
 import subprocess
 import sys
+import traceback
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -180,7 +254,39 @@ except Exception as e:
 DATUM_NAME_DEFAULT = "IGN SRVN16"
 
 # Script version (reported in logs and the traceability record).
-__version__ = "6.0"
+__version__ = "6.1"
+
+# 6.1: water-surface extrapolation beyond the last value of a path (slope
+# continuation) is reported as a WARNING only past this distance [m]; shorter
+# ones (e.g. a transect a few tens of metres up a tributary from the confluence)
+# are informative notes. Overridable with --ws-extrap-tol.
+WS_EXTRAP_TOL_DEFAULT = 200.0
+
+# 6.1: the slope used to continue the water surface beyond the last value of a
+# path is a least-squares fit over the values nearest to that end, taken until
+# they span at least this distance [m] (and at least two values).
+WS_SLOPE_WINDOW = 1000.0
+
+# 6.1: a GNSS water-surface point whose second-nearest river axis is within this
+# margin [m] of the nearest one is flagged as AMBIGUOUS in water_surface_qc.csv
+# (typical at confluences); a 'rio' column in the CSV forces its river.
+WS_AMBIG_MARGIN = 25.0
+
+# 6.1: a gauge or GNSS point farther than this [m] from its river's axis (or
+# projected onto an axis END, i.e. beyond the digitised reach, by more than
+# STATION_END_TOL) is not used for the water surface: its chainage would be wrong.
+STATION_AXIS_TOL = 250.0
+STATION_END_TOL = 50.0
+
+# 6.1: transect location by SECTION CROSSING — the track's principal axis is
+# extended by max(MIN, FRAC x track length) on each side before intersecting the
+# centerlines, so a track that stops short of the channel axis still crosses it.
+TRACK_LOC_MARGIN_MIN = 15.0
+TRACK_LOC_MARGIN_FRAC = 0.15
+
+# 6.1: rise [m] between consecutive water-surface anchors, going downstream,
+# tolerated before it is flagged (GNSS noise is a few cm).
+WS_MONO_TOL = 0.05
 
 # Tolerance [m] for deciding that a line's endpoint lies ON a river's main path,
 # i.e. that the line is a side branch (island split) rather than a disjoint reach.
@@ -665,7 +771,11 @@ def group_repeat_stats(group, s_grid, depth_grid, centroid=None,
         o = np.argsort(s_rep)
         rows.append(np.interp(s_grid, s_rep[o], dg[o], left=np.nan, right=np.nan))
     stack = np.vstack(rows) if rows else np.empty((0, s_grid.size))
-    with np.errstate(invalid="ignore"):
+    # Nodes beyond the reach of every repetition (the merged bank ramps) are
+    # all-NaN columns by construction; numpy warns about them through the
+    # `warnings` module, which np.errstate does not silence.
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
         sigma = np.nanstd(stack, axis=0) if stack.size else np.full_like(s_grid, np.nan)
         rms = [float(np.sqrt(np.nanmean((row - depth_grid) ** 2)))
                if np.any(np.isfinite(row)) else float("nan") for row in stack]
@@ -830,7 +940,8 @@ def flow_direction_for(data: dict, utm: np.ndarray, args, log: list | None = Non
 
 def section_orientation_qc(theta_section: float, utm: np.ndarray,
                            network=None, utm_crs=None,
-                           centroid=None, log: list | None = None) -> dict:
+                           centroid=None, log: list | None = None,
+                           river=None) -> dict:
     """
     Diagnose HOW TRANSVERSE the section really is.
 
@@ -861,7 +972,7 @@ def section_orientation_qc(theta_section: float, utm: np.ndarray,
 
     if network is not None and utm_crs is not None and centroid is not None:
         try:
-            th_cl = network.tangent_azimuth(centroid, utm_crs)
+            th_cl = network.tangent_azimuth(centroid, utm_crs, river=river)
             if th_cl is not None and np.isfinite(th_cl):
                 # centerline-perpendicular vs the flow-perpendicular section
                 d2 = math.degrees(theta_section - (th_cl + math.pi / 2.0))
@@ -1268,11 +1379,12 @@ def project_to_axis(
 # ============================================================================ #
 
 def format_progresiva(p_m: float) -> str:
-    """Argentine chainage notation: metres -> 'k+mmm.mm' (e.g. 12340.5 -> '12+340.50')."""
-    sign = "-" if p_m < 0 else ""
-    p = abs(float(p_m))
+    """Argentine chainage notation: metres -> 'k+mmm.mm' (e.g. 12340.5 -> '12+340.50').
+    6.1: rounded to the centimetre BEFORE splitting — 1999.999 printed '1+1000.00'."""
+    p = round(abs(float(p_m)), 2)
+    sign = "-" if p_m < 0 and p > 0 else ""
     km = int(p // 1000)
-    m  = p - km * 1000.0
+    m = round(p - km * 1000.0, 2)
     return f"{sign}{km}+{m:06.2f}"
 
 
@@ -1507,15 +1619,28 @@ class RiverNetwork:
         if not self.axes:
             raise ValueError("centerline produced no usable river axis")
 
+        # 6.1: [progresivas] keys matched accent/case-insensitively ('Neuquén' =
+        # 'Neuquen'); a key matching no river used to be ignored silently
+        by_norm = {_norm_name(ax.river): ax.river for ax in self.axes}
+        offs = {}
+        for k, v in self.river_offsets.items():
+            r = k if k in by_norm.values() else by_norm.get(_norm_name(k))
+            if r is None:
+                self._log.append(f"[warn] [progresivas] '{k}' matches no river of the "
+                                 f"centerline {sorted(by_norm.values())} — ignored")
+                continue
+            offs[r] = v
+        self.river_offsets = offs
         for ax in self.axes:
             self._log.append(
                 f"[info] río '{ax.river}': main {ax.length:.0f} m, "
                 f"{len(ax.anabranches)} anabranch(es), {len(ax.islands)} island(s); "
                 f"official offset {self.river_offsets.get(ax.river, 0.0):.1f} m")
 
-        self.survey_offsets = None
+        self.survey_offsets = None             # legacy v5/v6.0 single chain
         self.survey_ok = False
         self._by_river = {ax.river: ax for ax in self.axes}
+        self._build_topology()                 # 6.1: links + head->outlet paths
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -1621,7 +1746,23 @@ class RiverNetwork:
         best["km_oficial"] = self.river_offsets.get(best["river"], 0.0) + best["km_internal"]
         return best
 
-    def tangent_azimuth(self, centroid, from_crs=None, span: float = 50.0):
+    def locate_on(self, river, x, y):
+        """Like locate(), but on the axis of a GIVEN river (6.1). Used for gauges,
+        whose river is declared: near a confluence the nearest axis can belong to
+        another river, and its chainage would then be meaningless. Returns None
+        if the river is not in the network. `at_end` flags a projection clamped
+        onto an end of the main (point beyond the digitised reach)."""
+        ax = self._by_river.get(river)
+        if ax is None:
+            return None
+        km_i, brazo, role, dist = ax.locate_local(x, y)
+        return dict(river=river, role=role, brazo=brazo, km_internal=km_i,
+                    dist=dist,
+                    km_oficial=self.river_offsets.get(river, 0.0) + km_i,
+                    at_end=(km_i <= 1e-6 or km_i >= ax.length - 1e-6))
+
+    def tangent_azimuth(self, centroid, from_crs=None, span: float = 50.0,
+                        river=None):
         """
         Local direction of the river centerline at the point nearest `centroid`,
         as a math-convention angle (CCW from +East) IN THE COORDINATES OF
@@ -1642,7 +1783,11 @@ class RiverNetwork:
 
         p = Point(cx, cy)
         best_line, best_d = None, float("inf")
+        # 6.1: on the transect's own river when known — near a confluence the
+        # nearest line can belong to another river
         for ax in self.axes:
+            if river and river in self._by_river and ax.river != river:
+                continue
             for g in [ax.main] + [ab["geom"] for ab in ax.anabranches]:
                 d = g.distance(p)
                 if d < best_d:
@@ -1679,8 +1824,11 @@ class RiverNetwork:
         return (round(xy[0] / NODE_SNAP_TOL), round(xy[1] / NODE_SNAP_TOL))
 
     def build_survey_chain(self, rivers_present):
-        """Order the surveyed rivers into a single downstream chain and set the
-        cumulative INTERNAL offsets used for the longitudinal profile.
+        """LEGACY (v5/v6.0), kept verbatim for API compatibility; the 6.1 pipeline
+        uses the head-to-outlet PATHS instead (see _build_topology), which need
+        no trunk choice. Order the surveyed rivers into a single downstream
+        chain and set the cumulative INTERNAL offsets used for the longitudinal
+        profile.
 
         Returns the ordered list of river names, or None when the surveyed rivers
         do not form a single unambiguous chain — then the profile falls back to
@@ -1750,26 +1898,283 @@ class RiverNetwork:
             return None
         return self.survey_offsets[river] + km_internal
 
+    # ------------------------------------------------------------------ #
+    #  6.1 — river-to-river topology and head-to-outlet PATHS
+    # ------------------------------------------------------------------ #
+    def _build_topology(self):
+        """Link every river's downstream end to the river it flows into and
+        enumerate the head-to-outlet PATHS (6.1).
+
+        A river r flows into d when r's downstream end lies on d's main line
+        (within NODE_SNAP_TOL) at a chainage s_join that d CONTINUES past — a
+        node where two rivers END (Neuquen and Limay) is a shared inflow, not a
+        link between them. s_join is 0 when d starts there (Negro) and > 0 for a
+        tributary joining mid-reach.
+
+        A PATH starts at a head (a river no other river flows into at its km 0)
+        and follows the links to the outlet: Neuquen>Negro, Limay>Negro. Along a
+        path the chainage p is continuous. Rivers downstream of a confluence
+        belong to every path through it: that shared reach is where the water
+        surfaces of the tributaries meet, so no trunk has to be chosen."""
+        self.links, self.paths, self.junctions = {}, [], []
+        for ax in self.axes:
+            pt = Point(ax.ds_xy)
+            cands = []
+            for other in self.axes:
+                if other is ax:
+                    continue
+                d = float(other.main.distance(pt))
+                if d > NODE_SNAP_TOL:
+                    continue
+                s_join = float(other.main.project(pt))
+                if s_join >= other.length - NODE_SNAP_TOL:
+                    continue                    # other river also ends here
+                cands.append((d, other.river, s_join))
+            if len(cands) == 1:
+                self.links[ax.river] = dict(down=cands[0][1], s_join=cands[0][2])
+            elif len(cands) > 1:
+                self._log.append(
+                    f"[warn] río '{ax.river}': its downstream end touches "
+                    f"{[c[1] for c in cands]} — ambiguous outflow, treated as an outlet "
+                    "(check the centerline linework / flow_dir)")
+
+        into_start = {r for r, lk in self.links.items() if lk["s_join"] <= NODE_SNAP_TOL}
+        starts_fed = {self.links[r]["down"] for r in into_start}
+        heads = [ax.river for ax in self.axes if ax.river not in starts_fed]
+        for h in heads:
+            segs, p, cur, seen = [], 0.0, h, set()
+            s0 = 0.0
+            while cur is not None and cur not in seen:
+                seen.add(cur)
+                L = self._by_river[cur].length
+                segs.append(dict(river=cur, s0=s0, s1=L, p0=p))
+                p += L - s0
+                lk = self.links.get(cur)
+                if lk is None:
+                    break
+                if lk["down"] in seen:
+                    self._log.append(f"[warn] centerline loop at '{lk['down']}' — path "
+                                     f"from '{h}' stopped there")
+                    break
+                cur, s0 = lk["down"], lk["s_join"]
+            self.paths.append(dict(name=">".join(sg["river"] for sg in segs),
+                                   head=h, segs=segs, length=p))
+        self.path_order = list(range(len(self.paths)))
+
+        # junctions: (downstream river, s_join) with the rivers flowing in there
+        jmap = {}
+        for r, lk in self.links.items():
+            key = None
+            for k in jmap:
+                if k[0] == lk["down"] and abs(k[1] - lk["s_join"]) <= NODE_SNAP_TOL:
+                    key = k
+                    break
+            key = key or (lk["down"], lk["s_join"])
+            jmap.setdefault(key, []).append(r)
+        for (d, sj), ups in jmap.items():
+            # distance from the junction to the outlet along its downstream path
+            rest = 0.0
+            cur, s_from = d, sj
+            seen = set()
+            while cur is not None and cur not in seen:
+                seen.add(cur)
+                rest += self._by_river[cur].length - s_from
+                lk = self.links.get(cur)
+                cur, s_from = (lk["down"], lk["s_join"]) if lk else (None, 0.0)
+            self.junctions.append(dict(river=d, s=float(sj), ups=sorted(ups),
+                                       mid_reach=sj > NODE_SNAP_TOL, to_outlet=rest))
+        self.junctions.sort(key=lambda j: -j["to_outlet"])     # upstream first
+
+        for ax in self.axes:
+            lk = self.links.get(ax.river)
+            self._log.append(
+                f"[info] topology: '{ax.river}' -> "
+                + (f"'{lk['down']}' at its km {lk['s_join']:.0f} m" if lk else "outlet"))
+        for pa in self.paths:
+            self._log.append(f"[info] path {pa['name']}: {pa['length'] / 1000.0:.2f} km")
+
+    def path_positions(self, river, km_internal, tol: float = 1.0):
+        """[(path index, p)] of every path containing (river, km_internal)."""
+        out = []
+        if river is None or km_internal is None:
+            return out
+        s = float(km_internal)
+        for i, pa in enumerate(self.paths):
+            for sg in pa["segs"]:
+                if sg["river"] == river and sg["s0"] - tol <= s <= sg["s1"] + tol:
+                    out.append((i, sg["p0"] + (s - sg["s0"])))
+                    break
+        return out
+
+    def rank_paths(self, located, log=None):
+        """Order the paths for display (long profile, index sort) by how many of
+        the `located` transects [(river, km_internal)] they hold. Only the
+        display depends on this order — the water surface uses every path."""
+        cnt = [0] * len(self.paths)
+        for river, km in located:
+            for i, _p in self.path_positions(river, km):
+                cnt[i] += 1
+        self.path_order = sorted(range(len(self.paths)),
+                                 key=lambda i: (-cnt[i], self.paths[i]["name"]))
+        if log is not None and self.paths:
+            log.append("[info] paths by transect count: "
+                       + ", ".join(f"{self.paths[i]['name']} ({cnt[i]})"
+                                   for i in self.path_order))
+        return cnt
+
+    def display_position(self, river, km_internal):
+        """(rank, path name, p) on the first path, in display order, holding
+        (river, km_internal); (None, '', None) if none."""
+        pos = dict(self.path_positions(river, km_internal))
+        for rank, i in enumerate(self.path_order):
+            if i in pos:
+                return rank, self.paths[i]["name"], float(pos[i])
+        return None, "", None
+
+    def locate_all(self, x, y):
+        """locate_local() of (x, y) on EVERY river, nearest first (6.1)."""
+        out = []
+        for ax in self.axes:
+            km_i, brazo, role, dist = ax.locate_local(x, y)
+            out.append(dict(river=ax.river, role=role, brazo=brazo, km_internal=km_i,
+                            dist=dist, km_oficial=self.river_offsets.get(ax.river, 0.0) + km_i,
+                            at_end=(km_i <= 1e-6 or km_i >= ax.length - 1e-6)))
+        out.sort(key=lambda d: d["dist"])
+        return out
+
+    def locate_track(self, xs, ys, force_river=None, method="crossing"):
+        """Locate a TRANSECT from its track (6.1): river, brazo and chainage where
+        the SECTION LINE crosses a channel centerline (the HEC-RAS convention),
+        not the channel nearest to the track centroid.
+
+        Near a confluence the nearest-centroid rule is unreliable: a section
+        across the Negro a few metres below the node, with a track covering
+        mostly one bank, has its centroid closer to the end of the Limay's line
+        and was reported as 'Limay'. The section line is the principal axis of
+        the track, extended by max(TRACK_LOC_MARGIN_MIN, FRAC x length) on each
+        side; if it crosses several channels the crossing nearest to the track
+        centroid wins. If it crosses none, or for method='centroid' (the v6.0
+        rule), the nearest axis to the centroid is used. `force_river` (the INI
+        [rios] override) restricts the search to that river.
+
+        Returns dict(river, role, brazo, km_internal, km_oficial, dist, method,
+        note); `dist` is the distance from the track centroid to the crossing."""
+        x = np.asarray(xs, dtype=float).ravel()
+        y = np.asarray(ys, dtype=float).ravel()
+        ok = np.isfinite(x) & np.isfinite(y)
+        x, y = x[ok], y[ok]
+        if x.size == 0:
+            raise ValueError("track has no finite position")
+        cx, cy = float(x.mean()), float(y.mean())
+        if force_river:
+            nearest = self.locate_on(force_river, cx, cy)
+        else:
+            nearest = self.locate(cx, cy)
+        tag = "manual" if force_river else None
+
+        def _fallback(meth, note):
+            out = dict(nearest)
+            out.pop("at_end", None)
+            out.update(method=tag or meth, note=note)
+            return out
+
+        if method == "centroid":
+            return _fallback("centroid", "")
+        if x.size < 3:
+            return _fallback("nearest", "track too short for a section line")
+        P = np.column_stack([x - cx, y - cy])
+        w, v = np.linalg.eigh(P.T @ P)
+        u = v[:, int(np.argmax(w))]
+        t = P @ u
+        lo, hi = float(t.min()), float(t.max())
+        if hi - lo < 1.0:
+            return _fallback("nearest", "track too short for a section line")
+        m = max(TRACK_LOC_MARGIN_MIN, TRACK_LOC_MARGIN_FRAC * (hi - lo))
+        seg = LineString([(cx + (lo - m) * u[0], cy + (lo - m) * u[1]),
+                          (cx + (hi + m) * u[0], cy + (hi + m) * u[1])])
+
+        def _points(g):
+            if g is None or g.is_empty:
+                return []
+            if g.geom_type == "Point":
+                return [g]
+            if g.geom_type in ("MultiPoint", "GeometryCollection", "MultiLineString"):
+                return [q for gg in g.geoms for q in _points(gg)]
+            if g.geom_type == "LineString":          # collinear overlap
+                return [g.interpolate(0.5, normalized=True)]
+            return []
+
+        cands = []
+        for ax in self.axes:
+            if force_river and ax.river != force_river:
+                continue
+            for g in [ax.main] + [ab["geom"] for ab in ax.anabranches]:
+                for q in _points(seg.intersection(g)):
+                    tq = (q.x - cx) * u[0] + (q.y - cy) * u[1]
+                    cands.append((abs(tq), ax.river, float(q.x), float(q.y)))
+        if not cands:
+            if force_river:
+                return _fallback("manual", f"forced to {force_river} ([rios]); the section "
+                                           "does not cross its axis, km from the track "
+                                           "centroid projected on it")
+            return _fallback("nearest", "the section line crosses no centerline — "
+                                        "nearest axis to the track centroid used")
+        cands.sort(key=lambda c: c[0])
+        d0, river, qx, qy = cands[0]
+        km_i, brazo, role, _d = self._by_river[river].locate_local(qx, qy)
+        notes = []
+        others = sorted({c[1] for c in cands if c[1] != river})
+        if others:
+            notes.append("section also crosses " + ", ".join(others))
+        if not force_river and nearest["river"] != river:
+            notes.append(f"nearest axis to the track centroid is {nearest['river']} "
+                         f"({nearest['dist']:.0f} m) — the crossing wins")
+        return dict(river=river, role=role, brazo=brazo, km_internal=float(km_i),
+                    km_oficial=self.river_offsets.get(river, 0.0) + float(km_i),
+                    dist=float(d0), method=tag or "crossing", note="; ".join(notes))
+
 
 def read_ws_csv(csv_path, east_col="East", north_col="North", elev_col="H_correg"):
     """Read a water-surface CSV -> list of (x, y, elevation) in the file's CRS."""
-    rows = []
+    pts, _skipped, _cols = read_ws_table(csv_path, east_col, north_col, elev_col)
+    return [(p["x"], p["y"], p["h"]) for p in pts]
+
+
+def read_ws_table(csv_path, east_col="East", north_col="North", elev_col="H_correg"):
+    """Read a water-surface CSV keeping each point's identifier (6.1).
+
+    Returns (points, skipped, columns): points = [dict(id, x, y, h)] in the
+    file's CRS; skipped = [(row_label, reason)] for rows that could not be
+    parsed, so they are REPORTED instead of dropped silently. The id comes from
+    a punto/point/id/name column if present, else the 1-based data row number.
+    A UTF-8 BOM (typical of Excel exports) is handled."""
+    pts, skipped = [], []
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         rd = csv.DictReader(f)
-        cols = rd.fieldnames or []
+        cols = [c.strip() for c in (rd.fieldnames or [])]
+        rd.fieldnames = cols
         ec = _pick_col(cols, east_col, ["east", "x", "este", "x_utm", "x_posgar07"])
         nc = _pick_col(cols, north_col, ["north", "y", "norte", "y_utm", "y_posgar07"])
         hc = _pick_col(cols, elev_col, ["h_correg", "z", "elev", "cota", "h", "altura"])
+        ic = _pick_col(cols, None, ["punto", "point", "id", "name", "nombre", "pto", "pt"])
+        rc = _pick_col(cols, None, ["rio", "río", "river"])      # 6.1: optional override
         if not (ec and nc and hc):
             raise ValueError(f"WS CSV: could not resolve E/N/elev columns among {cols}")
-        for r in rd:
+        for k, r in enumerate(rd, 1):
+            label = (str(r.get(ic) or "").strip() if ic else "") or f"row{k}"
             try:
-                rows.append((float(r[ec]), float(r[nc]), float(r[hc])))
+                x, y, h = float(r[ec]), float(r[nc]), float(r[hc])
             except (TypeError, ValueError):
+                skipped.append((label, f"non-numeric {ec}/{nc}/{hc}"))
                 continue
-    if len(rows) < 2:
+            if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(h)):
+                skipped.append((label, "non-finite value"))
+                continue
+            river = (str(r.get(rc) or "").strip() if rc else "")
+            pts.append(dict(id=label, x=x, y=y, h=h, river=river))
+    if len(pts) < 2:
         raise ValueError("WS CSV: need at least 2 valid points")
-    return rows
+    return pts, skipped, dict(east=ec, north=nc, elev=hc, id=ic, river=rc)
 
 
 class WaterSurfaceProfile:
@@ -1864,25 +2269,84 @@ def _parse_dt(s):
     return None
 
 
+STN_ATTR_X = ("x", "este", "east", "e", "x_posgar07", "x_utm", "coord_x")
+STN_ATTR_Y = ("y", "norte", "north", "n", "y_posgar07", "y_utm", "coord_y")
+
+
+def _norm_name(s):
+    """Accent- and case-insensitive key for river names ('Neuquén' == 'neuquen')."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode()
+    return t.strip().lower()
+
+
+def _read_station_table(path, crs_default):
+    """Read a station registry from a CSV/TXT (X/Y columns, coordinates in
+    `crs_default`) or from any vector file geopandas can open (6.1).
+
+    geopandas/pyogrio return a plain DataFrame — no geometry, no .crs, every
+    field a string — for a CSV; that is what used to crash the registry.
+    Returns (rows, crs): rows = [dict(attrs={lower_col: value}, x, y)]."""
+    path = Path(path)
+    if path.suffix.lower() in (".csv", ".txt"):
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rd = csv.DictReader(f)
+            recs = [{str(k).strip().lower(): v for k, v in r.items() if k is not None}
+                    for r in rd]
+        crs = CRS.from_user_input(crs_default)
+        geom = None
+    else:
+        gdf = gpd.read_file(path)
+        recs = [{str(k).strip().lower(): v for k, v in r.items() if k != "geometry"}
+                for r in gdf.to_dict("records")]
+        has_geom = (isinstance(gdf, gpd.GeoDataFrame) and "geometry" in gdf.columns
+                    and gdf.geometry.notna().any())
+        geom = list(gdf.geometry) if has_geom else None
+        crs = (gdf.crs if has_geom and gdf.crs is not None
+               else CRS.from_user_input(crs_default))
+    rows = []
+    cols = set(recs[0].keys()) if recs else set()
+    cx = next((c for c in STN_ATTR_X if c in cols), None)
+    cy = next((c for c in STN_ATTR_Y if c in cols), None)
+    for i, a in enumerate(recs):
+        x = y = None
+        if geom is not None and geom[i] is not None and not geom[i].is_empty:
+            g = geom[i] if geom[i].geom_type == "Point" else geom[i].representative_point()
+            x, y = float(g.x), float(g.y)
+        elif cx and cy:
+            try:
+                x, y = float(a[cx]), float(a[cy])
+            except (TypeError, ValueError):
+                x = y = None
+        rows.append(dict(attrs=a, x=x, y=y))
+    if geom is None and not (cx and cy):
+        raise ValueError(f"stations: no geometry and no X/Y columns among {sorted(cols)}")
+    return rows, crs
+
+
 class StationRegistry:
-    """Hydrometric stations (point vector): station_id, name, river, gauge_zero
+    """Hydrometric stations (points): station_id, name, river, gauge_zero
     (cero de escala, cota SRVN16), optional chainage. Each station is placed on
     the network (river + internal chainage) so its readings interpolate in the
     same chainage frame as the transects. ws_elev of a reading = gauge_zero +
-    nivel. The registry is built once and reused between campaigns."""
+    nivel. The registry is built once and reused between campaigns.
+
+    6.1: CSV registries (X/Y columns in --ws-crs) are read directly; a station
+    is projected on its DECLARED river's axis (not the nearest axis of any
+    river); stations off their axis, beyond the digitised reach, on a river the
+    centerline does not have, or without gauge_zero are kept out of `stations`
+    and listed in `excluded` with the reason."""
 
     def __init__(self, stations_path, network, crs_override="EPSG:5344", log=None):
         if not HAS_GPD:
             raise RuntimeError("StationRegistry needs geopandas/shapely")
         self._log = log if log is not None else []
-        gdf = gpd.read_file(stations_path)
-        if gdf.crs is None:
-            gdf = gdf.set_crs(crs_override)
-            self._log.append(f"[warn] stations have no .prj; assuming {crs_override}")
-        if network.crs is not None and gdf.crs != network.crs:
-            gdf = gdf.to_crs(network.crs)
+        rows, src_crs = _read_station_table(stations_path, crs_override)
+        tr = None
+        if network.crs is not None and CRS.from_user_input(src_crs) != network.crs:
+            tr = Transformer.from_crs(src_crs, network.crs, always_xy=True)
 
-        cols = {c.lower(): c for c in gdf.columns}
+        cols = {c: c for c in (rows[0]["attrs"].keys() if rows else [])}
         c_id = _resolve_col(cols, STN_ATTR_ID)
         c_nm = _resolve_col(cols, STN_ATTR_NAME)
         c_rv = _resolve_col(cols, STN_ATTR_RIVER)
@@ -1890,48 +2354,85 @@ class StationRegistry:
         c_ch = _resolve_col(cols, STN_ATTR_CHAIN)
         if not (c_id and c_z0):
             raise ValueError("stations: need at least station_id and gauge_zero "
-                             f"columns among {list(gdf.columns)}")
+                             f"columns among {sorted(cols)}")
+        by_norm = {_norm_name(ax.river): ax.river for ax in network.axes}
 
-        self.stations = {}
-        for _, row in gdf.iterrows():
-            g = row.geometry
-            if g is None or g.is_empty:
+        def _txt(v):
+            t = "" if v is None else str(v).strip()
+            return "" if t.lower() in ("nan", "none") else t
+
+        self.stations, self.excluded = {}, {}
+        for row in rows:
+            a = row["attrs"]
+            sid = _txt(a.get(c_id))
+            if not sid:
                 continue
-            sid = str(row[c_id]).strip()
+            name = _txt(a.get(c_nm)) if c_nm else ""
+            name = name or sid
+            rec = dict(station_id=sid, name=name, river="", gauge_zero=None,
+                       x=row["x"], y=row["y"], km_internal=None, dist_axis=float("nan"),
+                       survey_chainage=None, reason="")
             try:
-                gz = float(row[c_z0])
+                gz = float(_txt(a.get(c_z0)))
+                rec["gauge_zero"] = gz if np.isfinite(gz) else None
             except (TypeError, ValueError):
-                self._log.append(f"[warn] station {sid}: bad gauge_zero — skipped")
-                continue
-            name = str(row[c_nm]).strip() if c_nm and row[c_nm] is not None else sid
-            river = str(row[c_rv]).strip() if c_rv and row[c_rv] is not None else ""
-            if river.lower() in ("nan", "none"):
-                river = ""
-            x, y = float(g.x), float(g.y)
+                rec["gauge_zero"] = None
+            if rec["gauge_zero"] is None:
+                rec["reason"] = "no gauge_zero (not levelled)"
+            if row["x"] is None or row["y"] is None:
+                rec["reason"] = rec["reason"] or "no coordinates"
+            else:
+                x, y = row["x"], row["y"]
+                if tr is not None:
+                    x, y = tr.transform(x, y)
+                rec["x"], rec["y"] = float(x), float(y)
+                declared = _txt(a.get(c_rv)) if c_rv else ""
+                river = by_norm.get(_norm_name(declared)) if declared else None
+                if declared and river is None:
+                    rec["river"] = declared
+                    rec["reason"] = rec["reason"] or (
+                        f"river '{declared}' is not in the centerline")
+                else:
+                    if river is None:            # undeclared -> nearest axis
+                        river = network.locate(x, y)["river"]
+                    rec["river"] = river
+                    loc = network.locate_on(river, x, y)
+                    rec["dist_axis"] = float(loc["dist"])
+                    km_explicit = None
+                    if c_ch and _txt(a.get(c_ch)):
+                        try:
+                            km_explicit = float(_txt(a.get(c_ch)))
+                        except (TypeError, ValueError):
+                            km_explicit = None
+                    if km_explicit is not None:
+                        rec["km_internal"] = km_explicit
+                    else:
+                        rec["km_internal"] = float(loc["km_internal"])
+                        if loc["at_end"] and loc["dist"] > STATION_END_TOL:
+                            rec["reason"] = rec["reason"] or (
+                                f"beyond the digitised {river} reach (projects onto "
+                                f"the axis end, {loc['dist']:.0f} m away)")
+                        elif loc["dist"] > STATION_AXIS_TOL:
+                            rec["reason"] = rec["reason"] or (
+                                f"{loc['dist']:.0f} m from the {river} axis "
+                                f"(> {STATION_AXIS_TOL:.0f} m)")
+            if rec["reason"]:
+                self.excluded[sid] = rec
+            else:
+                self.stations[sid] = rec
 
-            km_internal = None
-            if c_ch and row[c_ch] is not None and str(row[c_ch]).strip() != "":
-                try:
-                    km_internal = float(row[c_ch])
-                except (TypeError, ValueError):
-                    km_internal = None
-            if km_internal is None:
-                loc = network.locate(x, y)
-                km_internal = loc["km_internal"]
-                if not river:
-                    river = loc["river"]
-            elif not river:
-                river = network.locate(x, y)["river"]
-
-            self.stations[sid] = dict(
-                station_id=sid, name=name, river=river, gauge_zero=gz,
-                x=x, y=y, km_internal=km_internal, survey_chainage=None)
-
+        for sid, rec in self.excluded.items():
+            self._log.append(f"[info] station {sid} ({rec['name']}): {rec['reason']} "
+                             "— not used for the water surface")
         if not self.stations:
-            raise ValueError("stations file has no usable points")
+            raise ValueError("stations file has no usable station (see the [info] "
+                             "lines above for why each one was excluded)")
         self._log.append(
-            f"[info] stations: {len(self.stations)} loaded — "
-            + ", ".join(f"{s['station_id']}[{s['river']}]" for s in self.stations.values()))
+            f"[info] stations: {len(self.stations)} usable of "
+            f"{len(self.stations) + len(self.excluded)} — "
+            + ", ".join(f"{s['station_id']}[{s['river']} km {s['km_internal']:.0f}, "
+                        f"{s['dist_axis']:.0f} m off axis]"
+                        for s in self.stations.values()))
 
     def attach_survey_chainage(self, network):
         """Set survey_chainage on each station (after network.build_survey_chain)."""
@@ -1999,23 +2500,17 @@ class StationWS:
         self.registry = registry
         self.mode = mode
         self.data = data
-        usable = [s for s in registry.stations.values()
-                  if s.get("survey_chainage") is not None and s["station_id"] in data]
+        # 6.1: a station needs a reading, not a survey chainage — the water-surface
+        # model places it on its river and checks monotonicity per network path
+        usable = [s for s in registry.stations.values() if s["station_id"] in data]
         self._log.append(
-            f"[info] station water surface: mode={mode}, "
-            f"{len(usable)}/{len(registry.stations)} station(s) usable "
-            "(need a survey chainage and a reading)")
-        # monotonicity sanity on spot / mean elevations
-        pts = sorted(((s["survey_chainage"],
-                       s["gauge_zero"] + self._stage_at(s["station_id"], None))
-                      for s in usable
-                      if self._stage_at(s["station_id"], None) is not None),
-                     key=lambda t: t[0])
-        for (c0, e0), (c1, e1) in zip(pts, pts[1:]):
-            if e1 > e0 + 1e-6:
-                self._log.append(
-                    f"[warn] station WS not decreasing downstream: "
-                    f"{e0:.3f} m @ {c0:.0f} m -> {e1:.3f} m @ {c1:.0f} m")
+            f"[info] gauge readings: mode={mode}, {len(usable)}/{len(registry.stations)} "
+            "levelled station(s) have a reading"
+            + (": " + ", ".join(f"{s['station_id']} = {s['gauge_zero']:.3f} + "
+                                f"{self._stage_at(s['station_id'], None):.3f} m"
+                                for s in usable
+                                if self._stage_at(s['station_id'], None) is not None)
+               if usable else ""))
 
     def _stage_at(self, sid, when):
         if self.mode == "spot":
@@ -2063,6 +2558,497 @@ class StationWS:
         return float(np.interp(survey_chainage, xs, ys)), ""
 
 
+class WaterSurfaceModel:
+    """Water surface on the river NETWORK from GNSS points (primary) and gauge
+    readings (secondary) — 6.1.
+
+    Each river keeps its own water surface on its own chainage. Rivers are joined
+    along the head-to-outlet PATHS of the network (Neuquen>Negro, Limay>Negro):
+    the reach below a confluence belongs to every path through it, so it is the
+    COMMON downstream river where the tributaries' surfaces meet, and no trunk
+    has to be chosen.
+
+      1. ANCHORS — GNSS points (on the nearest river axis, or on the river named
+         in an optional 'rio' column of the CSV) and the gauges NOT bracketed by
+         GNSS points along some path; a gauge between GNSS points is QC only.
+      2. CONFLUENCES — the stage at each junction is estimated from EACH incoming
+         branch that has values: linear interpolation along that branch's path
+         between its last value upstream and the first value downstream of the
+         node, i.e. each tributary's slope continued into the common river. The
+         estimates are averaged (weight 1/interpolation gap) into ONE junction
+         anchor: the common reach gets a single surface and every tributary
+         meets it continuously. Their spread is QC'd against --ws-qc-tol. With
+         nothing downstream, the tributaries extrapolate down to the node; with
+         nothing upstream, the downstream surface is continued up to it.
+      3. LOOKUP, on every path through the point (averaged if several):
+           between two GNSS values             -> interpolation  source=survey
+           mixing gauge / junction values      -> interpolation  source=bridge
+           between two gauge values            -> interpolation  source=station
+           beyond the first/last value         -> SLOPE continuation  =extrap
+         The extrapolation continues the least-squares slope of the values
+         nearest to that end (spanning >= WS_SLOPE_WINDOW): a tributary without
+         values of its own takes the junction stage and continues upstream with
+         the slope of the common reach. It is a warning beyond --ws-extrap-tol.
+         v6.0 clamped a FLAT value beyond the last point (0.9 m/km x distance of
+         error here).
+
+    `rows` holds one record per GNSS point, gauge and junction for
+    water_surface_qc.csv (river, km, distance to axis, alternative river,
+    role, reason)."""
+
+    def __init__(self, network, points=None, station_ws=None, qc_tol=0.10,
+                 skipped=None, log=None, extrap_tol=WS_EXTRAP_TOL_DEFAULT):
+        self._log = log if log is not None else []
+        self.network = network
+        self.station_ws = station_ws
+        self.qc_tol = float(qc_tol)
+        self.extrap_tol = float(extrap_tol)
+        self.rows = []
+        self.gnss, self.gauges, self.qc_gauges = [], [], []
+        self._cache = {}
+        by_norm = {_norm_name(ax.river): ax.river for ax in network.axes}
+        nan = float("nan")
+
+        # ---- GNSS points --------------------------------------------------
+        raw, ambiguous = [], []
+        for pt in points or []:
+            forced = None
+            if pt.get("river"):
+                forced = by_norm.get(_norm_name(pt["river"]))
+                if forced is None:
+                    self._log.append(f"[warn] WS point {pt['id']}: river '{pt['river']}' "
+                                     "('rio' column) is not in the centerline — located "
+                                     "geometrically")
+            cands = network.locate_all(pt["x"], pt["y"])
+            loc = next(c for c in cands if c["river"] == forced) if forced else cands[0]
+            alt = next((c for c in cands if c["river"] != loc["river"]), None)
+            row = dict(kind="gnss", id=pt["id"], x=pt["x"], y=pt["y"], elev=pt["h"],
+                       river=loc["river"], km_internal=loc["km_internal"],
+                       km_oficial=loc["km_oficial"], dist_axis=loc["dist"],
+                       alt_river=alt["river"] if alt else "",
+                       alt_dist=alt["dist"] if alt else nan,
+                       role="anchor", note="river from the 'rio' column" if forced else "")
+            if loc["at_end"] and loc["dist"] > STATION_END_TOL:
+                row["role"] = "dropped"
+                row["note"] = (f"beyond the digitised {loc['river']} reach (projects onto "
+                               f"the axis end, {loc['dist']:.0f} m away)")
+            elif loc["dist"] > STATION_AXIS_TOL:
+                row["role"] = "dropped"
+                row["note"] = (f"{loc['dist']:.0f} m from the {loc['river']} axis "
+                               f"(> {STATION_AXIS_TOL:.0f} m)")
+            else:
+                if not forced and alt is not None \
+                        and alt["dist"] - loc["dist"] < WS_AMBIG_MARGIN:
+                    row["note"] = (f"AMBIGUOUS: {alt['river']} axis at {alt['dist']:.0f} m "
+                                   f"vs {loc['dist']:.0f} m — fill the 'rio' column to force")
+                    ambiguous.append(f"{pt['id']} ({loc['river']} {loc['dist']:.0f} m / "
+                                     f"{alt['river']} {alt['dist']:.0f} m)")
+                raw.append(dict(id=str(pt["id"]), river=loc["river"],
+                                s=float(loc["km_internal"]), h=float(pt["h"]),
+                                dist=float(loc["dist"])))
+            if row["role"] == "dropped":
+                self._log.append(f"[warn] WS point {pt['id']}: {row['note']} — not used")
+            self.rows.append(row)
+        for label, why in (skipped or []):
+            self.rows.append(dict(kind="gnss", id=label, x=None, y=None, elev=None,
+                                  river="", km_internal=None, km_oficial=None,
+                                  dist_axis=nan, alt_river="", alt_dist=nan,
+                                  role="dropped", note=why))
+            self._log.append(f"[warn] WS point {label}: {why} — ignored")
+        if ambiguous:
+            self._log.append("[warn] WS point(s) near a confluence with two candidate "
+                             "rivers (see water_surface_qc.csv; a 'rio' column forces "
+                             "the river): " + ", ".join(ambiguous))
+
+        for river in dict.fromkeys(r["river"] for r in raw):      # merge coincident
+            rs = sorted((r for r in raw if r["river"] == river), key=lambda r: r["s"])
+            i = 0
+            while i < len(rs):
+                j = i
+                while j + 1 < len(rs) and rs[j + 1]["s"] - rs[i]["s"] < 0.01:
+                    j += 1
+                grp = rs[i:j + 1]
+                self.gnss.append(dict(kind="gnss", id="+".join(r["id"] for r in grp),
+                                      river=river,
+                                      s=float(np.mean([r["s"] for r in grp])),
+                                      h=float(np.mean([r["h"] for r in grp])),
+                                      deps=frozenset({"gnss"})))
+                i = j + 1
+            ss = np.asarray([r["s"] for r in rs])
+            hh = np.asarray([r["h"] for r in rs])
+            slope = (float(np.polyfit(ss, hh, 1)[0] * 1000.0)
+                     if len(rs) >= 2 and np.ptp(ss) > 1.0 else nan)
+            self._log.append(
+                f"[info] water surface (GNSS), río '{river}': {len(rs)} pt(s), km "
+                f"{ss.min():.0f}–{ss.max():.0f} m, elev {hh.min():.3f}–{hh.max():.3f} m"
+                + ("" if not np.isfinite(slope) else f", slope {slope:.2f} m/km")
+                + f", max offset from axis {max(r['dist'] for r in rs):.0f} m")
+
+        # ---- gauges ---------------------------------------------------------
+        if station_ws is not None:
+            reg, data = station_ws.registry, station_ws.data
+            for sid, st in reg.stations.items():
+                row = dict(kind="gauge", id=sid, x=st["x"], y=st["y"], elev=None,
+                           river=st["river"], km_internal=st["km_internal"],
+                           km_oficial=(network.river_offsets.get(st["river"], 0.0)
+                                       + st["km_internal"]),
+                           dist_axis=st["dist_axis"], alt_river="", alt_dist=nan,
+                           role="", note="")
+                self.rows.append(row)
+                stage = station_ws._stage_at(sid, None)
+                if stage is None:
+                    row["role"] = "no reading"
+                    continue
+                elev = float(st["gauge_zero"] + stage)
+                row["elev"] = elev
+                g = dict(kind="gauge", id=sid, river=st["river"],
+                         s=float(st["km_internal"]), h=elev,
+                         zero=float(st["gauge_zero"]), name=st["name"],
+                         deps=frozenset({"gauge"}), row=row)
+                if self._bracketed(g["river"], g["s"]):
+                    row["role"] = "qc"
+                    self.qc_gauges.append(g)
+                else:
+                    row["role"] = "anchor"
+                    self.gauges.append(g)
+            for sid, rec in reg.excluded.items():
+                self.rows.append(dict(kind="gauge", id=sid, x=rec["x"], y=rec["y"],
+                                      elev=None, river=rec["river"],
+                                      km_internal=rec["km_internal"], km_oficial=None,
+                                      dist_axis=rec["dist_axis"], alt_river="",
+                                      alt_dist=nan, role="excluded", note=rec["reason"]))
+                if sid in data:
+                    self._log.append(f"[warn] gauge {sid} has a reading in this campaign "
+                                     f"but is excluded: {rec['reason']}")
+            for sid in data:
+                if sid not in reg.stations and sid not in reg.excluded:
+                    self._log.append(f"[warn] reading for station '{sid}', which is not "
+                                     "in the station registry — ignored")
+            if self.gauges:
+                self._log.append(
+                    "[info] gauge anchor(s) (not bracketed by GNSS): " + ", ".join(
+                        f"{g['id']} {g['river']} km {g['s']:.0f} = {g['h']:.3f} m"
+                        for g in self.gauges))
+
+        # ---- solve (spot / mean stages): junctions, QC, monotonicity --------
+        sol = self._solve(None)
+        for jr in sol["junctions"]:
+            J = jr["J"]
+            parts = [f"{e['branch']}: {e['value']:.3f} ({e['kind']} {e['frm']}"
+                     + (f"->{e['to']}" if e["to"] else "") + f" over {e['gap']:.0f} m)"
+                     for e in jr["ests"]]
+            note = "; ".join(parts) + f"; adopted {jr['h']:.3f} ({jr['how']})"
+            self.rows.append(dict(kind="junction", id=jr["anchor"]["id"], x=None, y=None,
+                                  elev=jr["h"], river=J["river"], km_internal=J["s"],
+                                  km_oficial=network.river_offsets.get(J["river"], 0.0) + J["s"],
+                                  dist_axis=nan, alt_river="", alt_dist=nan,
+                                  role="junction", note=note))
+            self._log.append(f"[info] confluence into '{J['river']}' at km {J['s']:.0f} "
+                             f"({' + '.join(J['ups'])}): stage {jr['h']:.3f} m — {note}")
+            ni = sum(1 for e in jr["ests"] if e["kind"] == "interp")
+            if ni >= 2:
+                tag = "PASS" if jr["spread"] <= self.qc_tol else "WARN"
+                self._log.append(
+                    f"[QA] confluence into '{J['river']}': the tributaries' estimates of the "
+                    f"junction stage differ by {jr['spread']:.3f} m (tol {self.qc_tol:.2f}) "
+                    f"{tag}")
+            elif jr["how"] != "interp":
+                self._log.append(f"[warn] confluence into '{J['river']}': stage "
+                                 f"EXTRAPOLATED ({jr['how']}) — no water-surface value on "
+                                 "one side of the node")
+        for g in self.qc_gauges:
+            res = self.resolve(g["river"], g["s"])
+            if res["ws_elev"] is None:
+                continue
+            dif = g["h"] - res["ws_elev"]
+            tag = "PASS" if abs(dif) <= self.qc_tol else "WARN"
+            g["row"]["note"] = (f"GNSS {res['ws_elev']:.3f} m; gauge-GNSS {dif:+.3f} m "
+                                f"(tol {self.qc_tol:.2f}) {tag}")
+            self._log.append(
+                f"[QA] gauge {g['id']} ({g['name']}) between GNSS points: {g['h']:.3f} m vs "
+                f"GNSS {res['ws_elev']:.3f} m, Δ={dif:+.3f} m (tol {self.qc_tol:.2f}) {tag}")
+        seen = set()
+        for pi, seq in enumerate(sol["per_path"]):
+            for (pa, a), (pb, b) in zip(seq, seq[1:]):
+                if b["h"] - a["h"] > WS_MONO_TOL and (a["id"], b["id"]) not in seen:
+                    seen.add((a["id"], b["id"]))
+                    self._log.append(
+                        f"[warn] water surface RISES downstream on "
+                        f"{network.paths[pi]['name']}: {a['id']} {a['h']:.3f} m -> "
+                        f"{b['id']} {b['h']:.3f} m over {pb - pa:.0f} m "
+                        f"(+{b['h'] - a['h']:.3f} m) — misplaced point, wrong gauge zero or "
+                        "reading?")
+            if seq:
+                kinds = {}
+                for _p, a in seq:
+                    kinds[a["kind"]] = kinds.get(a["kind"], 0) + 1
+                self._log.append(
+                    f"[info] path {network.paths[pi]['name']}: "
+                    + ", ".join(f"{v} {k}" for k, v in kinds.items())
+                    + f" value(s), p {seq[0][0] / 1000.0:.3f}–{seq[-1][0] / 1000.0:.3f} km")
+            else:
+                self._log.append(f"[info] path {network.paths[pi]['name']}: no "
+                                 "water-surface value")
+
+    # ------------------------------------------------------------------ #
+    def has_anchors(self):
+        return bool(self.gnss or self.gauges)
+
+    def _on_path(self, pi, anchors):
+        """[(p, anchor)] of the anchors lying on path `pi`, sorted by p."""
+        out = []
+        for a in anchors:
+            for i, p in self.network.path_positions(a["river"], a["s"]):
+                if i == pi:
+                    out.append((float(p), a))
+                    break
+        out.sort(key=lambda t: t[0])
+        return out
+
+    def _bracketed(self, river, s):
+        """True when GNSS points lie both upstream and downstream of (river, s)
+        along some path — a gauge there is a QC point, not an anchor."""
+        for pi, p in self.network.path_positions(river, s):
+            on = self._on_path(pi, self.gnss)
+            if any(q < p - 0.5 for q, _ in on) and any(q > p + 0.5 for q, _ in on):
+                return True
+        return False
+
+    @staticmethod
+    def _end_slope(seq, end):
+        """Least-squares slope dh/dp [m/m] over the values nearest to one end of
+        `seq` ([(p, anchor)] ascending; end=0 upstream, -1 downstream), taken
+        until they span WS_SLOPE_WINDOW. A slope rising downstream is replaced
+        by the whole-path fit, else by 0. Returns (slope, description)."""
+        if len(seq) < 2:
+            return 0.0, "flat: single value"
+        order = range(len(seq)) if end == 0 else range(len(seq) - 1, -1, -1)
+        pts = []
+        for i in order:
+            pts.append(seq[i])
+            if len(pts) >= 2 and abs(pts[-1][0] - pts[0][0]) >= WS_SLOPE_WINDOW:
+                break
+        ps = np.asarray([q[0] for q in pts])
+        hs = np.asarray([q[1]["h"] for q in pts])
+        if np.ptp(ps) < 1.0:
+            return 0.0, "flat: coincident values"
+        slope = float(np.polyfit(ps, hs, 1)[0])
+        why = f"{len(pts)} values over {np.ptp(ps):.0f} m"
+        if slope > 0:
+            ps2 = np.asarray([q[0] for q in seq])
+            hs2 = np.asarray([q[1]["h"] for q in seq])
+            s2 = float(np.polyfit(ps2, hs2, 1)[0]) if np.ptp(ps2) >= 1.0 else 0.0
+            if s2 <= 0:
+                return s2, f"whole path, {len(seq)} values (end window rose)"
+            return 0.0, "flat: the surface rises downstream here"
+        return slope, why
+
+    def _junction(self, J, anchors):
+        """Stage at junction J from every incoming branch (see class doc)."""
+        net = self.network
+        d, sj = J["river"], J["s"]
+        branches = {}
+        for pi, pj in net.path_positions(d, sj):
+            segs = net.paths[pi]["segs"]
+            k = next(i for i, sg in enumerate(segs) if sg["river"] == d)
+            br = d if (segs[k]["s0"] < sj - NODE_SNAP_TOL or k == 0) else segs[k - 1]["river"]
+            branches.setdefault(br, []).append((pi, pj))
+        if not branches:
+            return None
+        pi0, pj0 = next(iter(branches.values()))[0]
+        on0 = self._on_path(pi0, anchors)
+        if any(abs(p - pj0) <= 0.5 and a["kind"] != "junction" for p, a in on0):
+            return None                              # a measured value sits on the node
+        down = [(p - pj0, p, a) for p, a in on0 if p > pj0 + 0.5]
+        ests = []
+        for br, plist in branches.items():
+            best = None
+            for pi, pj in plist:
+                on = self._on_path(pi, anchors)
+                ups = [(pj - p, p, a) for p, a in on if p < pj - 0.5]
+                if ups:
+                    du, pu, au = min(ups, key=lambda t: t[0])
+                    if best is None or du < best[0]:
+                        best = (du, pu, au, [(p, a) for p, a in on if p < pj - 0.5])
+            if best is None:
+                continue                             # no value on this branch
+            du, pu, au, upseq = best
+            if down:
+                dd, _pd, ad = down[0]
+                gap = du + dd
+                v = au["h"] + (ad["h"] - au["h"]) * du / gap
+                ests.append(dict(branch=br, value=float(v), kind="interp", gap=float(gap),
+                                 frm=au["id"], to=ad["id"], deps=au["deps"] | ad["deps"]))
+            else:
+                slope, why = self._end_slope(upseq, -1)
+                ests.append(dict(branch=br, value=float(au["h"] + slope * du),
+                                 kind="extrap", gap=float(du), frm=au["id"], to="",
+                                 deps=au["deps"]))
+        interp = [e for e in ests if e["kind"] == "interp"]
+        use = interp or ests
+        if use:
+            w = np.asarray([1.0 / max(e["gap"], 1.0) for e in use])
+            h = float(np.sum(w * np.asarray([e["value"] for e in use])) / np.sum(w))
+            deps = frozenset().union(*[e["deps"] for e in use])
+            how = "interp" if interp else "extrap-down"
+            spread = float(np.ptp([e["value"] for e in use])) if len(use) > 1 else 0.0
+        elif down:
+            dd, _pd, ad = down[0]
+            slope, why = self._end_slope([(p, a) for _dd, p, a in down], 0)
+            h = float(ad["h"] - slope * dd)
+            deps, how, spread = ad["deps"], "extrap-up", 0.0
+            ests.append(dict(branch=d, value=h, kind="extrap-up", gap=float(dd),
+                             frm=ad["id"], to="", deps=deps))
+        else:
+            return None
+        anchor = dict(kind="junction", id=f"J:{d}@{sj:.0f}", river=d, s=float(sj), h=h,
+                      deps=deps)
+        return dict(anchor=anchor, J=J, ests=ests, how=how, spread=spread, h=h)
+
+    def _solve(self, when):
+        """Anchors (with gauge stages at `when` for time-series readings) plus
+        the junction anchors, per path. Cached per minute."""
+        key = None
+        if (when is not None and self.station_ws is not None
+                and self.station_ws.mode == "series" and self.gauges):
+            key = str(np.datetime64(when, "m"))
+        if key in self._cache:
+            return self._cache[key]
+        anchors = list(self.gnss)
+        for g in self.gauges:
+            h = g["h"]
+            if key is not None:
+                st = self.station_ws._stage_at(g["id"], when)
+                if st is not None:
+                    h = g["zero"] + float(st)
+            anchors.append(dict(g, h=float(h)))
+        junctions = []
+        for J in self.network.junctions:            # upstream junctions first
+            jr = self._junction(J, anchors)
+            if jr is not None:
+                anchors.append(jr["anchor"])
+                junctions.append(jr)
+        per_path = [self._on_path(i, anchors) for i in range(len(self.network.paths))]
+        sol = dict(anchors=anchors, per_path=per_path, junctions=junctions)
+        self._cache[key] = sol
+        return sol
+
+    def _eval_on_path(self, seq, p):
+        """Water surface at path chainage p from the path's values `seq`."""
+        if not seq:
+            return None
+        ps = [q[0] for q in seq]
+        if len(seq) == 1 or p < ps[0] - 0.5 or p > ps[-1] + 0.5:
+            end = 0 if (len(seq) == 1 or p < ps[0]) else -1
+            pe, ae = seq[end]
+            slope, why = self._end_slope(seq, end)
+            dist = p - pe
+            tag = "EXTRAP" if abs(dist) > self.extrap_tol else "extrap"
+            side = "upstream of" if dist < 0 else "downstream of"
+            note = (f"{tag} {abs(dist):.0f} m {side} {ae['id']} at "
+                    f"{slope * 1000.0:+.2f} m/km ({why})")
+            return dict(value=float(ae["h"] + slope * dist), source="extrap", note=note,
+                        extrap=abs(float(dist)), deps=ae["deps"])
+        k = bisect.bisect_right(ps, p) - 1
+        k = min(max(k, 0), len(seq) - 2)
+        (pa, a), (pb, b) = seq[k], seq[k + 1]
+        t = 0.0 if pb - pa < 1e-9 else min(max((p - pa) / (pb - pa), 0.0), 1.0)
+        val = a["h"] + t * (b["h"] - a["h"])
+        deps = a["deps"] | b["deps"]
+        if deps == {"gnss"}:
+            src, note = "survey", ""
+        else:
+            src = "station" if deps == {"gauge"} else "bridge"
+            note = (f"{src} {a['id']} ({a['h']:.3f}) -> {b['id']} ({b['h']:.3f}) "
+                    f"over {pb - pa:.0f} m")
+        return dict(value=float(val), source=src, note=note, extrap=0.0, deps=deps)
+
+    def resolve(self, river, km_internal, when=None):
+        """Water surface at (river, km_internal). Returns dict(ws_elev, source,
+        note, path, p, qc, extrap_m); ws_elev None (source='none') when no path
+        through the river carries any value."""
+        out = dict(ws_elev=None, source="none", note="", path="", p=None, qc=None,
+                   extrap_m=0.0)
+        if not river or km_internal is None:
+            out["note"] = "transect not located on the network"
+            return out
+        pos = self.network.path_positions(river, km_internal)
+        if not pos:
+            out["note"] = f"river '{river}' lies on no network path"
+            return out
+        sol = self._solve(when)
+        evals = []
+        for pi, p in pos:
+            e = self._eval_on_path(sol["per_path"][pi], p)
+            if e is not None:
+                evals.append((pi, p, e))
+        if not evals:
+            out["note"] = f"no GNSS point, gauge or junction value on any path through {river}"
+            return out
+        interp = [t for t in evals if t[2]["source"] != "extrap"]
+        use = interp or evals
+        vals = np.asarray([t[2]["value"] for t in use])
+        pi, p, e = min(use, key=lambda t: t[2]["extrap"])
+        note = e["note"]
+        if len(use) > 1 and float(np.ptp(vals)) > 0.0005:
+            note = ((note + "; ") if note else "") + \
+                f"mean of {len(use)} paths (spread {float(np.ptp(vals)):.3f} m)"
+        out.update(ws_elev=float(vals.mean()), source=e["source"], note=note,
+                   path=self.network.paths[pi]["name"], p=float(p),
+                   extrap_m=float(e["extrap"]))
+        return out
+
+    # -------------------------------------------------------------- plots
+    def path_series(self, pi, p_values):
+        """Water surface along path `pi` at chainages `p_values` (mean stages)."""
+        seq = self._solve(None)["per_path"][pi]
+        out = []
+        for p in p_values:
+            e = self._eval_on_path(seq, float(p))
+            out.append(np.nan if e is None else e["value"])
+        return np.asarray(out, dtype=float)
+
+    def path_markers(self, pi):
+        """{'gnss'|'gauge'|'junction'|'qc': [(p, elev, id)]} on path `pi`."""
+        seq = self._solve(None)["per_path"][pi]
+        out = dict(gnss=[], gauge=[], junction=[], qc=[])
+        for p, a in seq:
+            out[a["kind"]].append((p, a["h"], a["id"]))
+        for g in self.qc_gauges:
+            for i, p in self.network.path_positions(g["river"], g["s"]):
+                if i == pi:
+                    out["qc"].append((p, g["h"], g["id"]))
+        return out
+
+    def write_csv(self, path):
+        """water_surface_qc.csv: one row per GNSS point, gauge and junction."""
+        def f(v, fmt):
+            return ("" if v is None or (isinstance(v, float) and not np.isfinite(v))
+                    else fmt.format(v))
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["kind", "id", "river", "km_internal_m", "km_oficial_m",
+                        "dist_axis_m", "alt_river", "alt_dist_m", "elev_m", "role",
+                        "note", "x", "y"])
+            for r in self.rows:
+                w.writerow([r["kind"], r["id"], r["river"], f(r["km_internal"], "{:.2f}"),
+                            f(r["km_oficial"], "{:.2f}"), f(r["dist_axis"], "{:.1f}"),
+                            r.get("alt_river", ""), f(r.get("alt_dist"), "{:.1f}"),
+                            f(r["elev"], "{:.3f}"), r["role"], r["note"],
+                            f(r["x"], "{:.3f}"), f(r["y"], "{:.3f}")])
+        return Path(path)
+
+
+def _ws_is_warn(source, note) -> bool:
+    """Whether a transect's water-surface note is a warning (6.1): no surface,
+    a legacy clamp, an extrapolation beyond --ws-extrap-tol (upper-case
+    'EXTRAP'), or a failed QC. Interpolations (survey, bridge, station) and a
+    short slope continuation ('extrap', lower case) are informative."""
+    n = str(note or "")
+    return (source in ("clamp", "none") or "EXTRAP" in n or "QC dif" in n
+            or n.startswith("single"))
+
+
 def representative_time(data):
     """Best-effort representative datetime for a transect from System.Time.
     Returns np.datetime64 or None.
@@ -2081,6 +3067,15 @@ def representative_time(data):
     if t.size == 0:
         return None
     v = float(np.median(t))
+    # 6.1: RiverSurveyor System.Time is seconds since 2000-01-01, verified in
+    # sontek_time() against the file-name timestamp. 2026 is ~8.3e8 s, which fell
+    # between the datenum and Unix branches below, so this returned None and
+    # time-series gauges silently used their mean. Same epoch as sontek_time.
+    if 1e8 < v < 2e9:
+        try:
+            return np.datetime64(SONTEK_EPOCH + datetime.timedelta(seconds=v))
+        except (OverflowError, ValueError):
+            return None
     if 6e5 < v < 8e5:                          # MATLAB datenum (days), year ~2000+
         try:
             dt = (datetime.datetime.fromordinal(int(v) - 366)
@@ -2633,6 +3628,19 @@ def acceptance_tests(theta_flow: float, theta_section: float,
 #  PER-TRANSECT DRIVER
 # ============================================================================ #
 
+def _manual_river(args, network, perfil_id, log=None):
+    """River forced for a transect by the INI [rios] section (6.1), matched
+    accent- and case-insensitively against the centerline river names."""
+    want = (getattr(args, "manual_rivers", None) or {}).get(perfil_id)
+    if not want or network is None:
+        return None
+    river = {_norm_name(ax.river): ax.river for ax in network.axes}.get(_norm_name(want))
+    if river is None and log is not None:
+        log.append(f"[warn] [rios] {perfil_id} = {want}: that river is not in the "
+                   "centerline — override ignored")
+    return river
+
+
 def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
                 datum_name: str = DATUM_NAME_DEFAULT,
                 survey_outdir: Path | None = None, quiet: bool = False):
@@ -2667,8 +3675,12 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
         qinfo = transect_discharge(mat)
     except Exception as e:
         log.append(f"[error] could not read/extract {matpath.name}: {e}")
-        if not quiet:
-            print("\n".join(log))
+        try:
+            (outdir / "process_log.txt").write_text("\n".join(log) + "\n",
+                                                    encoding="utf-8")
+        except Exception:
+            pass
+        print("\n".join(log) if not quiet else f"    {log[-1]}")
         return None
 
     log.append(f"[info] samples: {len(data['vb_depth'])}  "
@@ -2760,23 +3772,33 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
     role = ""
     progresiva_m = None            # official km of the transect's river (reported)
     km_internal = None             # per-river internal chainage
-    survey_chainage = None         # continuous internal chainage along the survey
+    survey_chainage = None         # 6.1: continuous chainage along its display path
+    recorrido, path_rank = "", None
+    loc_method, loc_note = "", ""
     dist_axis = float("nan")
     if network is not None:
+        # 6.1: where the SECTION crosses a centerline, not the axis nearest to
+        # the centroid (which put a Negro section below the confluence on the Limay)
         tr_c = Transformer.from_crs(utm_crs, network.crs, always_xy=True)
-        cx_r, cy_r = tr_c.transform(centroid[0], centroid[1])
-        loc = network.locate(cx_r, cy_r)
+        tx, ty = tr_c.transform(utm[:, 0], utm[:, 1])
+        force = _manual_river(args, network, perfil_id, log)
+        loc = network.locate_track(tx, ty, force_river=force,
+                                   method=getattr(args, "transect_locate", "crossing"))
         river = loc["river"]; role = loc["role"]; brazo = loc["brazo"]
         km_internal = loc["km_internal"]; progresiva_m = loc["km_oficial"]
-        dist_axis = loc["dist"]
-        survey_chainage = network.survey_chainage(river, km_internal)
+        dist_axis = loc["dist"]; loc_method = loc["method"]; loc_note = loc["note"]
+        path_rank, recorrido, survey_chainage = network.display_position(river, km_internal)
         log.append(
             f"[info] río={river} [{role}]"
             + (f" ({brazo})" if brazo else "")
             + f"   km oficial {progresiva_m:.2f} m ({format_progresiva(progresiva_m)})"
-            + f"   dist to axis = {dist_axis:.1f} m")
+            + f"   located by {loc_method}, centroid-to-axis {dist_axis:.1f} m")
+        if loc_note:
+            log.append(("[warn] location: " if loc_method == "nearest"
+                        else "[info] location: ") + loc_note)
         if survey_chainage is not None:
-            log.append(f"[info] survey chainage (continuous) = {survey_chainage:.2f} m")
+            log.append(f"[info] path {recorrido}: continuous chainage "
+                       f"{survey_chainage:.2f} m")
     else:
         log.append("[info] chainage: not computed (no --centerline)")
 
@@ -2791,45 +3813,68 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
     ws_elev = None
     ws_note = ""
     ws_source = ""
-    x_ws = survey_chainage
-    gnss_val, gnss_note, gnss_covers = None, "", False
-    if wsp is not None and x_ws is not None:
-        gnss_val, gnss_note = wsp.elev_at(x_ws)
-        gnss_covers = wsp.covers(x_ws)
-    stn_val, stn_note = None, ""
-    if station_ws is not None and x_ws is not None:
-        stn_val, stn_note = station_ws.elev_at(x_ws, river, when=when)
+    x_ws = (network.survey_chainage(river, km_internal)       # legacy single chain
+            if network is not None and km_internal is not None else None)
+    qc_dif = None
+    if wsp is not None and hasattr(wsp, "resolve"):
+        # 6.1: WaterSurfaceModel — frames, GNSS/gauge bridge, per-river fallback
+        res = wsp.resolve(river, km_internal, when=when)
+        if res["ws_elev"] is not None:
+            ws_elev, ws_note, ws_source = res["ws_elev"], res["note"], res["source"]
+            if res.get("qc"):
+                qc_dif = res["qc"]["dif"]
+        else:
+            ws_note = res["note"]
+    else:
+        # legacy path: a bare WaterSurfaceProfile (+ StationWS), as in v5/v6.0
+        gnss_val, gnss_note, gnss_covers = None, "", False
+        if wsp is not None and x_ws is not None:
+            gnss_val, gnss_note = wsp.elev_at(x_ws)
+            gnss_covers = wsp.covers(x_ws)
+        stn_val, stn_note = None, ""
+        if station_ws is not None and x_ws is not None:
+            stn_val, stn_note = station_ws.elev_at(x_ws, river, when=when)
 
-    if gnss_val is not None and gnss_covers:
-        ws_elev, ws_note, ws_source = gnss_val, gnss_note, "survey"
-    elif gnss_val is not None and stn_val is not None:
-        ws_elev, ws_note, ws_source = stn_val, stn_note, "station"   # gap-fill
-    elif gnss_val is not None:
-        ws_elev, ws_note, ws_source = gnss_val, gnss_note, "clamp"
-    elif stn_val is not None:
-        ws_elev, ws_note, ws_source = stn_val, stn_note, "station"
-    elif args.water_surface_elev:
-        ws_elev, ws_source = float(args.water_surface_elev), "constant"
+        if gnss_val is not None and gnss_covers:
+            ws_elev, ws_note, ws_source = gnss_val, gnss_note, "survey"
+        elif gnss_val is not None and stn_val is not None:
+            ws_elev, ws_note, ws_source = stn_val, stn_note, "station"   # gap-fill
+        elif gnss_val is not None:
+            ws_elev, ws_note, ws_source = gnss_val, gnss_note, "clamp"
+        elif stn_val is not None:
+            ws_elev, ws_note, ws_source = stn_val, stn_note, "station"
+        if gnss_val is not None and gnss_covers and stn_val is not None:
+            qc_dif = abs(gnss_val - stn_val)
+    if ws_elev is None and args.water_surface_elev:
+        ws_elev, ws_note, ws_source = float(args.water_surface_elev), "", "constant"
 
     if ws_elev is not None:
         msg = (f"[info] water surface = {ws_elev:.3f} m {datum_name} "
                f"[source={ws_source}]  -> bed elevations ABSOLUTE ({datum_name})")
         if ws_note:
-            msg += f"   [WARN {ws_note}]"
+            msg += (f"   [WARN {ws_note}]" if _ws_is_warn(ws_source, ws_note)
+                    else f"   [{ws_note}]")
         log.append(msg)
         # QC cross-check GNSS vs station where both exist
-        if gnss_val is not None and gnss_covers and stn_val is not None:
-            dif = abs(gnss_val - stn_val)
+        if qc_dif is not None:
             tol = float(getattr(args, "ws_qc_tol", 0.10) or 0.10)
-            tag = "PASS" if dif <= tol else "WARN"
-            log.append(f"[QA] WS GNSS vs estación: |Δ|={dif:.3f} m (tol {tol:.3f}) {tag}")
-            if dif > tol:
-                ws_note = (ws_note + "; " if ws_note else "") + f"QC dif={dif:.3f} m"
+            tag = "PASS" if qc_dif <= tol else "WARN"
+            log.append(f"[QA] WS GNSS vs estación: |Δ|={qc_dif:.3f} m (tol {tol:.3f}) {tag}")
+            if qc_dif > tol:
+                ws_note = (ws_note + "; " if ws_note else "") + f"QC dif={qc_dif:.3f} m"
+    else:
+        # 6.1: never silent — this transect's bed is RELATIVE (-depth)
+        ws_source = "none"
+        why = ws_note or ("no water-surface source configured" if wsp is None
+                          and station_ws is None else "no water surface at this chainage")
+        ws_note = f"SIN pelo de agua: {why}"
+        log.append(f"[warn] NO water surface for this transect ({why}) — bed "
+                   f"elevations are RELATIVE (-depth), not {datum_name}")
 
     # --------------------------------------------- v6 section-orientation QC
     orient_qc = section_orientation_qc(theta_section_final, utm,
                                        network=network, utm_crs=utm_crs,
-                                       centroid=centroid, log=log)
+                                       centroid=centroid, log=log, river=river)
 
     # ------------------------------------------------------------ STEP 5
     s_grid, depth_grid, s_shift, src_grid = build_profile(
@@ -2912,8 +3957,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
         ok_axis = dist_axis <= max(50.0, 0.75 * width)
         log.append(f"[QA] transect centroid close to river axis? "
                    f"{'PASS' if ok_axis else 'WARN'} (dist={dist_axis:.1f} m, "
-                   f"section width={width:.1f} m)")
-    if ws_note:
+                   f"section width={width:.1f} m, located by {loc_method})")
+    if ws_note and _ws_is_warn(ws_source, ws_note):
         log.append(f"[QA] water-surface interpolation: WARN — {ws_note}")
 
     # write the per-transect log to disk
@@ -2949,7 +3994,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
         perfil=perfil_id, outdir=outdir,
         river=river, role=role, brazo=brazo, dist_axis=dist_axis,
         km_internal=km_internal, km_oficial=progresiva_m,
-        survey_chainage=survey_chainage,
+        survey_chainage=survey_chainage, recorrido=recorrido, path_rank=path_rank,
+        loc_method=loc_method, loc_note=loc_note,
         ws_elev=ws_elev, ws_note=ws_note, ws_source=ws_source,
         s_grid=s_grid, depth_grid=depth_grid, bed_elev=bed,
         xp=geo["xp"], yp=geo["yp"],
@@ -2966,8 +4012,7 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
         t_start=t_start,
         prof_E=geo["E"], prof_N=geo["N"],
         q_total=qinfo["q_total"], q_left=qinfo["q_left"], q_right=qinfo["q_right"],
-        group_chainage=(survey_chainage if survey_chainage is not None
-                        else progresiva_m),
+        group_chainage=progresiva_m,        # 6.1: same river is required anyway
         cloud=cloud, data_ref=data, utm_ref=utm, centroid=centroid,
         src_grid=src_grid, edge_l=edge_l, edge_r=edge_r,
         depth_ref=depth_ref, bt_geometry=bt_geometry, composite=composite_on,
@@ -3138,23 +4183,46 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
     river = ref.get("river", ""); brazo = ref.get("brazo", ""); role = ref.get("role", "")
     km_internal = ref.get("km_internal"); progresiva_m = ref.get("km_oficial")
     survey_chainage = ref.get("survey_chainage"); dist_axis = ref.get("dist_axis", float("nan"))
+    recorrido, path_rank = ref.get("recorrido", ""), ref.get("path_rank")
+    loc_method, loc_note = ref.get("loc_method", ""), ""
     utm_crs = ref["utm_crs"]; posgar_crs = ref["posgar_crs"]
     if network is not None:
-        tr_c = Transformer.from_crs(utm_crs, network.crs, always_xy=True)
-        cx_r, cy_r = tr_c.transform(centroid[0], centroid[1])
-        loc = network.locate(cx_r, cy_r)
+        # 6.1: section crossing of the pooled tracks, on the members' river
+        txs, tys = [], []
+        for r in group:
+            u = r.get("utm_ref")
+            if u is None:
+                continue
+            trm = Transformer.from_crs(r["utm_crs"], network.crs, always_xy=True)
+            a, b = trm.transform(np.asarray(u)[:, 0], np.asarray(u)[:, 1])
+            txs.append(np.asarray(a)); tys.append(np.asarray(b))
+        if txs:
+            loc = network.locate_track(np.concatenate(txs), np.concatenate(tys),
+                                       force_river=(river or None),
+                                       method=getattr(args, "transect_locate", "crossing"))
+        else:
+            tr_c = Transformer.from_crs(utm_crs, network.crs, always_xy=True)
+            loc = network.locate(*tr_c.transform(centroid[0], centroid[1]))
+            loc.update(method="centroid", note="")
         river, role, brazo = loc["river"], loc["role"], loc["brazo"]
         km_internal, progresiva_m, dist_axis = loc["km_internal"], loc["km_oficial"], loc["dist"]
-        survey_chainage = network.survey_chainage(river, km_internal)
+        loc_method = ref.get("loc_method") or loc["method"]
+        loc_note = loc["note"] if loc["method"] == "nearest" else ""
+        path_rank, recorrido, survey_chainage = network.display_position(river, km_internal)
         log.append(f"[info] río={river} [{role}]" + (f" ({brazo})" if brazo else "")
                    + f"   km oficial {progresiva_m:.2f} m "
-                     f"({format_progresiva(progresiva_m)})  dist eje={dist_axis:.1f} m")
+                     f"({format_progresiva(progresiva_m)})  dist eje={dist_axis:.1f} m"
+                   + (f"   recorrido {recorrido}" if recorrido else ""))
 
     # water surface: mean of the repetitions (same occupation, same stage)
     ws_vals = [r["ws_elev"] for r in group if r.get("ws_elev") is not None]
     ws_elev = float(np.mean(ws_vals)) if ws_vals else None
     ws_source = ref.get("ws_source", "")
     ws_note = "; ".join(sorted({r["ws_note"] for r in group if r.get("ws_note")}))
+    if ws_elev is None:
+        ws_source = "none"
+        log.append(f"[warn] NO water surface for this group — bed elevations are "
+                   f"RELATIVE (-depth), not {datum_name}")
     if ws_vals and len(ws_vals) > 1:
         spread = float(np.max(ws_vals) - np.min(ws_vals))
         log.append(f"[info] pelo de agua del grupo = {ws_elev:.3f} m {datum_name} "
@@ -3249,7 +4317,8 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         perfil=gid, outdir=outdir,
         river=river, role=role, brazo=brazo, dist_axis=dist_axis,
         km_internal=km_internal, km_oficial=progresiva_m,
-        survey_chainage=survey_chainage,
+        survey_chainage=survey_chainage, recorrido=recorrido, path_rank=path_rank,
+        loc_method=loc_method, loc_note=loc_note,
         ws_elev=ws_elev, ws_note=ws_note, ws_source=ws_source,
         s_grid=s_grid, depth_grid=depth_grid, bed_elev=bed,
         xp=geo["xp"], yp=geo["yp"],
@@ -3263,7 +4332,7 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         cloud_ens=cloud["ens"], cloud_rel=(ws_elev is None),
         src_grid=src_grid, edge_l=edge_l, edge_r=edge_r,
         t_start=min((r["t_start"] for r in group if r.get("t_start")), default=None),
-        group_chainage=(survey_chainage if survey_chainage is not None else progresiva_m),
+        group_chainage=progresiva_m,
         is_group=True, n_reps=len(group),
         members=[r["perfil"] for r in group],
         rep_stack=stack, rep_sigma=sigma, rep_rms=rep_rms,
@@ -3284,8 +4353,8 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
 # ============================================================================ #
 
 def _prof_x(r):
-    """X of a transect on the longitudinal profile: the continuous survey
-    chainage when available, else the river's official km."""
+    """X of a transect on the longitudinal profile: the continuous chainage
+    along its display path (6.1) when available, else the river's official km."""
     x = r.get("survey_chainage")
     if x is None:
         x = r.get("km_oficial")
@@ -3293,33 +4362,43 @@ def _prof_x(r):
 
 
 def _sort_key(r):
+    """Display order: by path (most transects first), then along it (6.1)."""
     x = _prof_x(r)
-    return float("inf") if x is None else float(x)
+    rank = r.get("path_rank")
+    return (float("inf") if rank is None else float(rank),
+            float("inf") if x is None else float(x))
 
 
 def write_survey_index(results, resumen_dir: Path, datum_name: str):
-    """One row per transect: river, official km, brazo, cotas, ancho, WS source."""
+    """One row per transect: river, official km, brazo, cotas, ancho, WS source.
+    6.1: written with the csv module (notes may contain commas); `recorrido`
+    and `loc_method` appended at the end so existing column positions hold."""
     path = resumen_dir / "survey_index.csv"
     rs = sorted(results, key=_sort_key)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("perfil,river,km_oficial_m,km_oficial,brazo,survey_chainage_m,"
-                "ws_elev_m,ws_source,thalweg_elev_m,max_depth_m,width_m,"
-                "n_samples,dist_axis_m,theta_flow_deg,ws_note,q_m3s\n")
+
+    def _f(v, fmt):
+        return "" if v is None or (isinstance(v, float) and not np.isfinite(v)) \
+            else fmt.format(v)
+
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["perfil", "river", "km_oficial_m", "km_oficial", "brazo",
+                    "survey_chainage_m", "ws_elev_m", "ws_source", "thalweg_elev_m",
+                    "max_depth_m", "width_m", "n_samples", "dist_axis_m",
+                    "theta_flow_deg", "ws_note", "q_m3s", "recorrido", "loc_method"])
         for r in rs:
             kmo = r.get("km_oficial")
-            prog = "" if kmo is None else f"{kmo:.3f}"
-            progf = "" if kmo is None else format_progresiva(kmo)
-            sc = r.get("survey_chainage")
-            scs = "" if sc is None else f"{sc:.3f}"
-            ws = "" if r["ws_elev"] is None else f"{r['ws_elev']:.3f}"
-            th = "" if r["ws_elev"] is None else f"{r['thalweg_elev']:.3f}"
-            da = "" if not np.isfinite(r["dist_axis"]) else f"{r['dist_axis']:.1f}"
-            _q = r.get("q_total")
-            qs = "" if _q is None or not np.isfinite(_q) else f"{_q:.3f}"
-            f.write(f"{r['perfil']},{r.get('river','')},{prog},{progf},{r['brazo']},"
-                    f"{scs},{ws},{r.get('ws_source','')},{th},"
-                    f"{r['max_depth']:.3f},{r['width_m']:.2f},{r['n_samples']},"
-                    f"{da},{math.degrees(r['theta_flow']):.1f},{r['ws_note']},{qs}\n")
+            absolute = r["ws_elev"] is not None
+            w.writerow([
+                r["perfil"], r.get("river", ""), _f(kmo, "{:.3f}"),
+                "" if kmo is None else format_progresiva(kmo), r["brazo"],
+                _f(r.get("survey_chainage"), "{:.3f}"),
+                _f(r["ws_elev"], "{:.3f}"), r.get("ws_source", ""),
+                _f(r["thalweg_elev"], "{:.3f}") if absolute else "",
+                f"{r['max_depth']:.3f}", f"{r['width_m']:.2f}", r["n_samples"],
+                _f(r["dist_axis"], "{:.1f}"), f"{math.degrees(r['theta_flow']):.1f}",
+                r["ws_note"], _f(r.get("q_total"), "{:.3f}"),
+                r.get("recorrido", ""), r.get("loc_method", "")])
     return path
 
 
@@ -3364,7 +4443,7 @@ def plot_survey_planview(results, network, resumen_dir: Path):
         seenr = set()
         for axr in network.axes:
             xs, ys = axr.main.xy
-            lbl = f"Eje {axr.river} (tronco)"
+            lbl = f"Eje {axr.river} (cauce principal)"
             ax.plot(xs, ys, "-", color="0.6", lw=1.4,
                     label=lbl if lbl not in seenr else None)
             seenr.add(lbl)
@@ -3409,31 +4488,153 @@ def plot_survey_planview(results, network, resumen_dir: Path):
     return path
 
 
-def plot_long_profile(results, wsp, resumen_dir: Path, datum_name: str):
-    """Longitudinal profile: water surface + thalweg vs the continuous survey
-    chainage (falls back to per-river official km when the chain is undefined)."""
+def _legend_unique(ax, **kw):
+    h, l = ax.get_legend_handles_labels()
+    seen, hh, ll = set(), [], []
+    for hi, li in zip(h, l):
+        if li and li not in seen:
+            seen.add(li); hh.append(hi); ll.append(li)
+    if hh:
+        ax.legend(hh, ll, **kw)
+
+
+def plot_long_profile(results, wsp, resumen_dir: Path, datum_name: str, network=None):
+    """Longitudinal profile(s): water surface + thalweg.
+
+    6.1: one panel per head-to-outlet PATH holding transects not drawn in an
+    earlier panel (paths in display order), on that path's continuous chainage;
+    the reach below a confluence is common to the paths through it. The water
+    surface is the network model evaluated along the path, with its GNSS points,
+    gauges (anchor / control) and junction stages. Without a network, the
+    v6.0 single-axis plot."""
+    net = network if network is not None else getattr(wsp, "network", None)
+    located = [r for r in results
+               if r.get("river") and r.get("km_internal") is not None]
+    if net is None or not getattr(net, "paths", None) or not located:
+        return _plot_long_profile_simple(results, wsp, resumen_dir, datum_name)
+    panels, drawn = [], set()
+    for pi in net.path_order:
+        on = []
+        for r in located:
+            pos = dict(net.path_positions(r["river"], r["km_internal"]))
+            if pi in pos:
+                on.append((float(pos[pi]), r))
+        if not on or all(r["perfil"] in drawn for _p, r in on):
+            continue
+        on.sort(key=lambda t: t[0])
+        panels.append((pi, on))
+        drawn.update(r["perfil"] for _p, r in on)
+    if not panels:
+        return None
+    absolute = any(r["ws_elev"] is not None for r in located)
+    model = wsp if hasattr(wsp, "path_series") else None
+    fig, axes = plt.subplots(len(panels), 1, figsize=(12, 5.8 * len(panels)),
+                             squeeze=False)
+    for (pi, on), ax in zip(panels, axes[:, 0]):
+        pa = net.paths[pi]
+        nombre = pa["name"].replace(">", " → ")
+        ps = np.asarray([p for p, _r in on])
+        pad = max(250.0, 0.04 * float(ps.max() - ps.min()))
+        x0, x1 = float(ps.min()) - pad, float(ps.max()) + pad
+        if absolute and model is not None:
+            pg = np.linspace(x0, x1, 800)
+            ax.plot(pg / 1000.0, model.path_series(pi, pg), "-", color="navy", lw=1.5,
+                    label="Pelo de agua (modelo de la red)", zorder=2)
+            mk = model.path_markers(pi)
+
+            def inr(t, lo=x0, hi=x1):
+                return lo <= t[0] <= hi
+            g = [t for t in mk["gnss"] if inr(t)]
+            if g:
+                ax.plot([t[0] / 1000.0 for t in g], [t[1] for t in g], ".",
+                        color="tab:cyan", ms=6, label="Puntos GNSS de pelo de agua", zorder=4)
+            for key, lab, fill in (("gauge", "Escala usada como ancla", "tab:red"),
+                                   ("qc", "Escala de control (entre puntos GNSS)", "none")):
+                lst = [t for t in mk[key] if inr(t)]
+                if lst:
+                    ax.plot([t[0] / 1000.0 for t in lst], [t[1] for t in lst], "s",
+                            color="tab:red", mfc=fill, ms=7, mew=1.5, label=lab, zorder=5)
+                    for t in lst:
+                        ax.annotate(t[2], (t[0] / 1000.0, t[1]), fontsize=7,
+                                    color="tab:red", xytext=(4, 4),
+                                    textcoords="offset points")
+            for t in [t for t in mk["junction"] if inr(t)]:
+                ax.plot(t[0] / 1000.0, t[1], "D", color="k", ms=6,
+                        label="Cota en la confluencia (estimada)", zorder=5)
+        for sg in pa["segs"][1:]:
+            if x0 <= sg["p0"] <= x1:
+                ax.axvline(sg["p0"] / 1000.0, color="0.45", ls="--", lw=1.0, zorder=1)
+                kmj = net.river_offsets.get(sg["river"], 0.0) + sg["s0"]
+                ax.annotate(f"confluencia → río {sg['river']} (km {format_progresiva(kmj)})",
+                            (sg["p0"] / 1000.0, 1.0),
+                            xycoords=("data", "axes fraction"), rotation=90, fontsize=8,
+                            color="0.3", ha="right", va="top", xytext=(-3, -4),
+                            textcoords="offset points")
+        xs = ps / 1000.0
+        if absolute:
+            for p, r in on:
+                if r["ws_elev"] is not None:
+                    ax.plot([p / 1000.0] * 2, [r["thalweg_elev"], r["ws_elev"]], "-",
+                            color="0.7", lw=0.8, zorder=1)
+            thal = [r["thalweg_elev"] if r["ws_elev"] is not None else np.nan
+                    for _p, r in on]
+            wss = [r["ws_elev"] if r["ws_elev"] is not None else np.nan for _p, r in on]
+            ax.plot(xs, thal, "o", color="#7a5230", ms=6,
+                    label="Thalweg (cota mínima del lecho)", zorder=3)
+            ax.plot(xs, wss, "_", color="navy", ms=10, mew=2,
+                    label="Pelo de agua en cada sección", zorder=3)
+            n_rel = sum(1 for _p, r in on if r["ws_elev"] is None)
+            if n_rel:
+                ax.text(0.01, 0.02, f"{n_rel} sección(es) sin pelo de agua (cotas "
+                                    "relativas) no graficadas", transform=ax.transAxes,
+                        fontsize=8, color="tab:red")
+            ax.set_ylabel(f"Cota {datum_name} [m]")
+        else:
+            thal = [-r["max_depth"] for _p, r in on]
+            ax.plot(xs, thal, "o-", color="#7a5230", ms=6,
+                    label="Thalweg (profundidad máx., relativa)")
+            ax.axhline(0, color="navy", lw=1, ls="--", alpha=0.7,
+                       label="Pelo de agua (rel.)")
+            ax.set_ylabel("Cota relativa al pelo de agua [m]")
+        for (p, r), th in zip(on, thal):
+            if r["brazo"]:
+                ax.annotate(r["brazo"], (p / 1000.0, thal_min(thal)), fontsize=7,
+                            color=_brazo_color(r["brazo"]), ha="center", va="top",
+                            xytext=(0, -2), textcoords="offset points")
+        ax.set_xlim(x0 / 1000.0, x1 / 1000.0)
+        ax.set_xlabel(f"Progresiva continua del recorrido {nombre} [km]")
+        ax.set_title(f"Perfil longitudinal — recorrido {nombre}: pelo de agua y thalweg")
+        ax.grid(True, alpha=0.3)
+        _legend_unique(ax, loc="best", fontsize=8)
+    fig.tight_layout()
+    path = resumen_dir / "survey_long_profile.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def _plot_long_profile_simple(results, wsp, resumen_dir: Path, datum_name: str):
+    """v6.0 single-axis longitudinal profile (no network / legacy profile)."""
     rs = [r for r in results if _prof_x(r) is not None]
     rs.sort(key=_sort_key)
     if not rs:
         return None
     absolute = any(r["ws_elev"] is not None for r in rs)
     fig, ax = plt.subplots(figsize=(12, 6))
-
-    if absolute and wsp is not None:
+    if absolute and wsp is not None and getattr(wsp, "prog", None) is not None:
         ax.plot(wsp.prog, wsp.elev, "-", color="navy", lw=1.6,
                 label="Perfil de pelo de agua (interpolado)")
-        ax.plot(wsp.raw_prog, wsp.raw_elev, ".", color="tab:cyan", ms=5,
-                alpha=0.7, label="Puntos de pelo de agua medidos")
-
+        if getattr(wsp, "raw_prog", None) is not None:
+            ax.plot(wsp.raw_prog, wsp.raw_elev, ".", color="tab:cyan", ms=5,
+                    alpha=0.7, label="Puntos de pelo de agua medidos")
     prog = [_prof_x(r) for r in rs]
     if absolute:
         thal = [r["thalweg_elev"] for r in rs]
-        wss  = [r["ws_elev"] if r["ws_elev"] is not None else np.nan for r in rs]
+        wss = [r["ws_elev"] if r["ws_elev"] is not None else np.nan for r in rs]
         for r in rs:
             if r["ws_elev"] is not None:
-                ax.plot([_prof_x(r), _prof_x(r)],
-                        [r["thalweg_elev"], r["ws_elev"]], "-",
-                        color="0.7", lw=0.8, zorder=1)
+                ax.plot([_prof_x(r), _prof_x(r)], [r["thalweg_elev"], r["ws_elev"]],
+                        "-", color="0.7", lw=0.8, zorder=1)
         ax.plot(prog, thal, "o", color="#7a5230", ms=6,
                 label="Thalweg (cota mínima del lecho)", zorder=3)
         ax.plot(prog, wss, "_", color="navy", ms=10, mew=2,
@@ -3445,15 +4646,12 @@ def plot_long_profile(results, wsp, resumen_dir: Path, datum_name: str):
                 label="Thalweg (profundidad máx., relativa)")
         ax.axhline(0, color="navy", lw=1, ls="--", alpha=0.7, label="Pelo de agua (rel.)")
         ax.set_ylabel("Cota relativa al pelo de agua [m]")
-
-    # brazo markers on the x baseline
     for r in rs:
         if r["brazo"]:
-            ax.annotate(r["brazo"], (_prof_x(r), thal_min(thal)),
-                        fontsize=7, color=_brazo_color(r["brazo"]),
-                        ha="center", va="top", xytext=(0, -2), textcoords="offset points")
-
-    ax.set_xlabel("Progresiva continua del relevamiento [m]")
+            ax.annotate(r["brazo"], (_prof_x(r), thal_min(thal)), fontsize=7,
+                        color=_brazo_color(r["brazo"]), ha="center", va="top",
+                        xytext=(0, -2), textcoords="offset points")
+    ax.set_xlabel("Progresiva [m]")
     ax.set_title("Perfil longitudinal del relevamiento — pelo de agua y thalweg")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best", fontsize=8)
@@ -3527,7 +4725,8 @@ def export_survey_beam_cloud(results, resumen_dir: Path):
         pt_id, transect, ens, beam_id, beam_type (slant|vert),
         bed_elev, depth, river, ws_elev, flag
     `flag` carries the water-surface source of the parent transect (survey /
-    station / clamp / constant) plus 'REL' when Z is a relative depth (no WS)."""
+    bridge / station / extrap / constant) plus 'REL' when Z is a relative depth
+    (no WS)."""
     if not HAS_GPD:
         return None
     crs5344 = CRS.from_epsg(5344)
@@ -3620,22 +4819,68 @@ def gather_matfiles(inputs):
     return uniq
 
 
+def prescan_transects(matfiles, network, args=None, log: list | None = None):
+    """Locate every transect on the network from its GPS alone (6.1).
+
+    Loads only the GPS struct of each .mat (scipy variable_names), rebuilds the
+    track exactly as process_one does (GPS.UTM when finite, else from Lat/Lon in
+    the auto UTM zone) and locates it with the SAME rule (section crossing, INI
+    [rios] override). Used BEFORE processing to rank the paths for display and
+    to check that every transect will get a water surface. Returns
+    [dict(perfil, river, km_internal, km_oficial, dist, method, note)]; files
+    that fail here are reported by process_one."""
+    out = []
+    method = getattr(args, "transect_locate", "crossing") if args is not None else "crossing"
+    for m in matfiles:
+        try:
+            mat = sio.loadmat(m, struct_as_record=False, squeeze_me=True,
+                              variable_names=["GPS"])
+            gps = mat.get("GPS")
+            lat = np.asarray(get_field(gps, "Latitude"), dtype=float).ravel()
+            lon = np.asarray(get_field(gps, "Longitude"), dtype=float).ravel()
+            utm = get_field(gps, "UTM")
+            utm = np.asarray(utm, dtype=float) if utm is not None else None
+            utm_crs = auto_utm_crs(lat, lon)
+            if utm is None or utm.ndim != 2 or not np.isfinite(utm).all():
+                tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
+                ex, ny = tr.transform(lon, lat)
+                utm = np.column_stack([ex, ny])
+            tr_c = Transformer.from_crs(utm_crs, network.crs, always_xy=True)
+            tx, ty = tr_c.transform(utm[:, 0], utm[:, 1])
+            stem = Path(m).stem
+            force = _manual_river(args, network, stem, log) if args is not None else None
+            loc = network.locate_track(tx, ty, force_river=force, method=method)
+            out.append(dict(perfil=stem, river=loc["river"],
+                            km_internal=loc["km_internal"], km_oficial=loc["km_oficial"],
+                            dist=loc["dist"], method=loc["method"], note=loc["note"]))
+        except Exception as e:
+            if log is not None:
+                log.append(f"[warn] pre-scan: could not locate {Path(m).name} from its "
+                           f"GPS ({e})")
+    if log is not None and out:
+        cnt = {}
+        for t in out:
+            cnt[t["river"]] = cnt.get(t["river"], 0) + 1
+        log.append("[info] transects per river (GPS pre-scan, located by "
+                   f"{method}): " + ", ".join(f"{k}: {v}" for k, v in cnt.items()))
+        for t in out:
+            if t["note"] or t["method"] not in ("crossing", "centroid"):
+                tag = "[warn]" if t["method"] == "nearest" else "[info]"
+                log.append(f"{tag} {t['perfil']}: {t['river']} km "
+                           f"{format_progresiva(t['km_oficial'])} ({t['method']})"
+                           + (f" — {t['note']}" if t["note"] else ""))
+    return out
+
+
 # ============================================================================ #
 #  CONFIG FILE (campaña.ini)  +  TRACEABILITY RECORD
 # ============================================================================ #
 
-# argparse dest -> type converter for values read from the INI config file.
-_CONFIG_TYPES = {
-    "outdir": str, "survey_name": str, "dx": float, "bin_half_width": float,
-    "water_surface_elev": float, "no_edge_extrapolation": bool,
-    "blend_beams": bool, "vb_min": int, "centerline": str,
-    "chainage_offset": float, "chainage_reverse": bool,
-    "water_surface_csv": str, "ws_east_col": str, "ws_north_col": str,
-    "ws_elev_col": str, "ws_crs": str, "datum_name": str,
-    "offset_scale": float, "no_offset_weighting": bool,
-    # v5
-    "stations": str, "readings": str, "ws_qc_tol": float,
-}
+# 6.1: the INI key schema is derived from the CLI parser (_config_schema); these
+# dests are not configuration values and are skipped there and in the record.
+_CONFIG_SKIP_DESTS = {"help", "version", "config"}
+# [procesamiento] keys that list the input .mat files / folders / globs.
+_CONFIG_INPUT_KEYS = ("inputs", "matfiles", "input", "entradas")
 # Config keys that are file/dir paths -> resolved relative to the config file.
 _CONFIG_PATHS = {"outdir", "centerline", "water_surface_csv", "stations", "readings"}
 
@@ -3657,9 +4902,28 @@ def _find_section(cp, names):
     return None
 
 
-def load_config(path):
+def _config_schema(parser):
+    """{dest: (kind, choices)} for every option of the CLI parser (6.1).
+
+    Derived from the parser itself so a new CLI option is automatically valid in
+    the INI. v6.0 kept a hand-written table that nobody updated for the v6 flags:
+    depth-ref, composite, group-tol, ... were silently IGNORED in campaign INIs."""
+    schema = {}
+    for a in parser._actions:
+        if not a.option_strings or a.dest in _CONFIG_SKIP_DESTS:
+            continue
+        if a.nargs == 0:                              # store_true switches
+            kind = bool
+        else:
+            kind = a.type if callable(a.type) else str
+        schema[a.dest] = (kind, tuple(a.choices) if a.choices else None)
+    return schema
+
+
+def load_config(path, parser=None, log: list | None = None):
     """
-    Read an INI config file (campaña.ini). Returns (params, campania):
+    Read an INI config file (campaña.ini). Returns (params, campania,
+    river_offsets, manual_groups):
       params   -> dict of argparse dest -> typed value (for parser.set_defaults)
       campania -> dict of free-form metadata (for the traceability record)
 
@@ -3667,6 +4931,11 @@ def load_config(path):
     Parameter keys may use '-' or '_'. File/dir paths are resolved relative to the
     config file's folder, so the config can live inside the campaign folder and
     use paths relative to it. Command-line options override anything set here.
+
+    6.1: every CLI option is a valid key (schema from the parser); values of
+    choice options are validated (argparse does not validate defaults); unknown
+    keys are reported in `log` instead of being dropped silently. In-line ';'
+    starts a comment in EVERY section (metadata included), as in v6.0.
     """
     cfgpath = Path(path)
     if not cfgpath.exists():
@@ -3678,6 +4947,10 @@ def load_config(path):
         cp.read(cfgpath, encoding="utf-8")
     except Exception as e:
         sys.exit(f"[error] could not parse config file: {e}")
+    if parser is None:
+        parser = build_parser()
+    schema = _config_schema(parser)
+    log = log if log is not None else []
 
     base = cfgpath.resolve().parent
     params, inputs = {}, []
@@ -3689,18 +4962,29 @@ def load_config(path):
             if val is None or str(val).strip() == "":
                 continue
             key = raw_key.strip().lower().replace("-", "_")
-            if key in ("inputs", "matfiles", "input", "entradas"):
+            if key in _CONFIG_INPUT_KEYS:
                 items = [s.strip() for line in str(val).splitlines()
                          for s in line.split(",") if s.strip()]
                 for it in items:
                     p = Path(it)
                     inputs.append(str(p if p.is_absolute() else (base / p)))
                 continue
-            if key not in _CONFIG_TYPES:
-                continue                      # ignore unknown keys silently
-            typ = _CONFIG_TYPES[key]
+            if key not in schema:
+                log.append(f"[warn] config [{proc}]: unknown key '{raw_key}' — ignored "
+                           "(typo? run with --help for the valid options)")
+                continue
+            typ, choices = schema[key]
+            sval = str(val).strip()
             try:
-                conv = _to_bool(val) if typ is bool else typ(str(val).strip())
+                if typ is bool:
+                    conv = _to_bool(sval)
+                elif choices:
+                    conv = sval.lower()
+                    if conv not in [str(c).lower() for c in choices]:
+                        sys.exit(f"[error] config: '{raw_key} = {sval}' — valid values: "
+                                 f"{', '.join(str(c) for c in choices)}")
+                else:
+                    conv = typ(sval)
             except (TypeError, ValueError):
                 sys.exit(f"[error] config: bad value for '{raw_key}': {val!r}")
             if key in _CONFIG_PATHS and conv:
@@ -3712,7 +4996,7 @@ def load_config(path):
 
     camp = _find_section(cp, ["campania", "campaña", "campanha",
                               "metadatos", "metadata"])
-    campania = dict(cp.items(camp)) if camp else {}
+    campania = {k: (v or "").strip() for k, v in cp.items(camp)} if camp else {}
 
     # [progresivas]: per-river official chainage offsets {river: offset_m}.
     # km_oficial = river_offset + internal_chainage. Rivers not listed use 0
@@ -3743,7 +5027,34 @@ def load_config(path):
             if ids:
                 manual_groups[str(gname).strip()] = ids
 
+    known = [proc, camp, prog, gsec, _find_section(cp, _RIVER_SECTIONS)]
+    for sec in cp.sections():
+        if sec not in known:
+            log.append(f"[warn] config: unknown section [{sec}] — ignored (valid: "
+                       "[campanha], [procesamiento], [progresivas], [grupos], [rios])")
+
     return params, campania, river_offsets, manual_groups
+
+
+# 6.1: [rios] — force the river of a transect (file stem = river name), for the
+# rare section the crossing rule still gets wrong.
+_RIVER_SECTIONS = ["rios", "ríos", "rio", "río", "asignacion_rio", "rivers"]
+
+
+def load_river_overrides(path):
+    """{transect id: river} from the INI [rios] section (6.1). Kept separate
+    from load_config() so its return signature stays as in v6.0."""
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    try:
+        cp.read(Path(path), encoding="utf-8")
+    except Exception:
+        return {}
+    sec = _find_section(cp, _RIVER_SECTIONS)
+    if not sec:
+        return {}
+    return {str(k).strip(): str(v).strip() for k, v in cp.items(sec)
+            if v is not None and str(v).strip()}
 
 
 def _git_commit(start_path):
@@ -3760,8 +5071,14 @@ def _git_commit(start_path):
 
 
 def write_run_record(out_dir, args, campania, matfiles, extra_lines=None,
-                     river_offsets=None):
-    """Write a human-readable traceability record of this run to procesamiento.txt."""
+                     river_offsets=None, setup_lines=None, warn_lines=None,
+                     transect_warn_lines=None, log_name=None):
+    """Write a human-readable traceability record of this run to procesamiento.txt.
+
+    6.1: records EVERY effective parameter (from the parser, so new options are
+    never missing), the network / paths / water-surface setup, every [warn] of
+    the run and the QA warnings of each transect; `log_name` points to the full
+    console transcript saved next to it."""
     lines = ["REGISTRO DE PROCESAMIENTO — process_adcp_bathimetric",
              f"script version : v{__version__}"]
     commit = _git_commit(sys.argv[0] if sys.argv and sys.argv[0] else __file__)
@@ -3769,6 +5086,8 @@ def write_run_record(out_dir, args, campania, matfiles, extra_lines=None,
         lines.append(f"git commit     : {commit}")
     lines.append(f"fecha de corrida: "
                  f"{datetime.datetime.now().isoformat(timespec='seconds')}")
+    if log_name:
+        lines.append(f"consola completa: {log_name}")
     if campania:
         lines += ["", "[campaña]"]
         lines += [f"  {k}: {v}" for k, v in campania.items()]
@@ -3778,16 +5097,32 @@ def write_run_record(out_dir, args, campania, matfiles, extra_lines=None,
               f"  water-surface CSV : {args.water_surface_csv}",
               f"  stations          : {getattr(args, 'stations', None)}",
               f"  readings          : {getattr(args, 'readings', None)}",
-              "", "[parámetros]"]
-    for key in ("dx", "bin_half_width", "vb_min", "blend_beams",
-                "chainage_offset", "chainage_reverse", "ws_crs", "datum_name",
-                "ws_qc_tol", "offset_scale", "no_offset_weighting",
-                "no_edge_extrapolation", "water_surface_elev",
-                "survey_name", "outdir"):
-        lines.append(f"  {key}: {getattr(args, key, None)}")
+              "", "[parámetros] (valores efectivos: CLI > INI > default)"]
+    seen = set()
+    for a in build_parser()._actions:
+        if not a.option_strings or a.dest in _CONFIG_SKIP_DESTS or a.dest in seen:
+            continue
+        seen.add(a.dest)
+        lines.append(f"  {a.dest}: {getattr(args, a.dest, None)}")
+    mg = getattr(args, "manual_groups", None)
+    if mg:
+        lines += ["", "[grupos] (forzados desde el INI)"]
+        lines += [f"  {k}: {' '.join(v)}" for k, v in mg.items()]
+    mr = getattr(args, "manual_rivers", None)
+    if mr:
+        lines += ["", "[rios] (río forzado por transecta desde el INI)"]
+        lines += [f"  {k}: {v}" for k, v in mr.items()]
     if river_offsets:
         lines += ["", "[progresivas] (offsets oficiales por río, m)"]
         lines += [f"  {k}: {v}" for k, v in river_offsets.items()]
+    if setup_lines:
+        lines += ["", "[red, recorridos y pelo de agua]"]
+        lines += [f"  {x}" for x in setup_lines]
+    lines += ["", f"[advertencias de la corrida] ({len(warn_lines or [])})"]
+    lines += [f"  {x}" for x in (warn_lines or [])] or ["  (ninguna)"]
+    if transect_warn_lines is not None:
+        lines += ["", f"[advertencias QA por transecta] ({len(transect_warn_lines)})"]
+        lines += [f"  {x}" for x in transect_warn_lines] or ["  (ninguna)"]
     if extra_lines:
         lines += [""] + list(extra_lines)
     path = Path(out_dir) / "procesamiento.txt"
@@ -3796,6 +5131,19 @@ def write_run_record(out_dir, args, campania, matfiles, extra_lines=None,
     except Exception:
         pass
     return path
+
+
+def collect_transect_warnings(results):
+    """Every WARN / [warn] / [error] line of every transect or group log (6.1),
+    prefixed with its profile id, for the campaign-level record."""
+    out = []
+    for r in sorted(results, key=_sort_key):
+        for line in r.get("log") or []:
+            t = str(line).strip()
+            if t.startswith("[warn]") or t.startswith("[error]") or " WARN" in t \
+                    or t.startswith("[WARN"):
+                out.append(f"{r['perfil']}: {t}")
+    return out
 
 
 def build_parser():
@@ -3825,9 +5173,9 @@ def build_parser():
     p.add_argument("--no-edge-extrapolation", action="store_true",
                    help="Disable bank extrapolation to depth=0 from Setup.Edges_*.")
     p.add_argument("--blend-beams", action="store_true",
-                   help="Blend vertical + slant beams together for the bed (older "
-                        "behaviour). Default: the nadir/vertical beam defines the bed "
-                        "where present, slant beams only fill near-bank/edge gaps.")
+                   help="DEPRECATED v5 flag, kept so old command lines run: forces "
+                        "composite=on and bt-geometry=footprints. Use --depth-ref / "
+                        "--composite / --bt-geometry instead.")
     p.add_argument("--vb-min", type=int, default=1,
                    help="Min. PRIMARY-reference points in a node window to use the "
                         "reference alone (default 1; higher = fall back to the "
@@ -3900,6 +5248,14 @@ def build_parser():
                    help="Global fallback official-km offset [m] for rivers not "
                         "listed in the INI [progresivas] section (per-river offsets "
                         "there take precedence). Default 0.")
+    p.add_argument("--transect-locate", choices=["crossing", "centroid"],
+                   default="crossing",
+                   help="6.1: how a transect is placed on the network. 'crossing' "
+                        "(default): river and km where the section line (principal "
+                        "axis of the track) crosses a centerline, HEC-RAS style — "
+                        "robust at confluences. 'centroid': nearest axis to the track "
+                        "centroid (v6.0 rule, reproduces old chainages). The INI "
+                        "[rios] section forces the river of a given transect.")
     p.add_argument("--chainage-reverse", action="store_true",
                    help="Measure chainage from the centerline's LAST vertex "
                         "(ignored where a water-surface CSV is given, since each "
@@ -3918,17 +5274,27 @@ def build_parser():
                    help=f"Vertical datum label for plots/columns (default '{DATUM_NAME_DEFAULT}').")
     # --- hydrometric stations (secondary water surface: fallback/gap-fill/QC) ---
     p.add_argument("--stations", default=None,
-                   help="Station registry (points shp: station_id, name, river, "
-                        "gauge_zero SRVN16, optional chainage). SECONDARY water "
-                        "surface, used to gap-fill beyond the GNSS range, as sole "
-                        "source when no GNSS is given, and for QC.")
+                   help="Station registry: CSV with X/Y columns in --ws-crs, or a "
+                        "points vector file (station_id, name, river, gauge_zero "
+                        "SRVN16, optional chainage). SECONDARY water surface: bridge "
+                        "beyond the GNSS range, sole source without GNSS, and QC.")
     p.add_argument("--readings", default=None,
                    help="Per-campaign level readings CSV. Spot (station_id, nivel) "
                         "or time-series (station_id, datetime, nivel), auto-detected. "
                         "ws_elev = gauge_zero + nivel.")
     p.add_argument("--ws-qc-tol", type=float, default=0.10,
-                   help="Tolerance [m] for the GNSS-vs-station water-surface QC "
-                        "cross-check (default 0.10).")
+                   help="Tolerance [m] for the water-surface QC: gauges between GNSS "
+                        "points vs the GNSS surface, and the spread of the tributaries' "
+                        "estimates of a confluence stage (default 0.10).")
+    p.add_argument("--ws-extrap-tol", type=float, default=WS_EXTRAP_TOL_DEFAULT,
+                   help="6.1: beyond the first/last water-surface value of a network "
+                        "path the surface is continued with its local slope; that "
+                        "extrapolation is flagged as a WARNING past this distance [m] "
+                        f"(default {WS_EXTRAP_TOL_DEFAULT:.0f}).")
+    p.add_argument("--allow-relative", action="store_true",
+                   help="6.1: when a water-surface source is configured but no "
+                        "transect can get a water surface, continue with RELATIVE "
+                        "bed elevations instead of stopping.")
     # --- perpendicular-offset penalty ---
     p.add_argument("--offset-scale", type=float, default=OFFSET_SCALE_DEFAULT,
                    help=f"Gaussian scale [m] for the perpendicular-offset penalty "
@@ -3945,12 +5311,130 @@ def _line_label(r):
     tag = f" ({r['brazo']})" if r.get("brazo") else ""
     ws = "" if r["ws_elev"] is None else f", pelo={r['ws_elev']:.3f}m[{r.get('ws_source','')}]"
     th = "" if r["ws_elev"] is None else f", thalweg={r['thalweg_elev']:.3f}m"
-    warn = f"  [WARN {r['ws_note']}]" if r.get("ws_note") else ""
+    note = r.get("ws_note") or ""
+    warn = ("" if not note else
+            f"  [WARN {note}]" if _ws_is_warn(r.get("ws_source", ""), note) else f"  [{note}]")
     return (f"{r['perfil']}: {r.get('river','')} km {prog}{tag}"
             f", ancho={r['width_m']:.1f}m, prof.máx={r['max_depth']:.2f}m{ws}{th}{warn}")
 
 
+class _Tee:
+    """File-like object writing to a console stream AND a capture buffer."""
+
+    def __init__(self, primary, buf):
+        self._primary, self._buf = primary, buf
+
+    def write(self, s):
+        try:
+            self._buf.write(s)
+        except Exception:
+            pass
+        return self._primary.write(s)
+
+    def flush(self):
+        try:
+            self._primary.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):                 # encoding, isatty, fileno, ...
+        return getattr(self._primary, name)
+
+
+class RunLog:
+    """Transcript of everything the run prints (6.1).
+
+    stdout and stderr are tee'd into memory from the first line of main(), so
+    the file also holds Python warnings (numpy, geopandas, ...), the reason of
+    an early stop and, on a crash, the traceback. It is written as
+    procesamiento.log in `target` (the _resumen folder, or the single-transect
+    output folder) when the run ends — whether it ends well or not. Before 6.1
+    the setup warnings only ever reached the console."""
+
+    NAME = "procesamiento.log"
+
+    def __init__(self):
+        self._buf = io.StringIO()
+        self._saved = None
+        self.target = None
+
+    def start(self):
+        if self._saved is None:
+            self._saved = (sys.stdout, sys.stderr)
+            sys.stdout = _Tee(sys.stdout, self._buf)
+            sys.stderr = _Tee(sys.stderr, self._buf)
+        return self
+
+    def stop(self):
+        if self._saved is not None:
+            for st in (sys.stdout, sys.stderr):
+                try:
+                    st.flush()
+                except Exception:
+                    pass
+            sys.stdout, sys.stderr = self._saved
+            self._saved = None
+
+    def note(self, text):
+        """Append to the transcript only (the console already shows it)."""
+        self._buf.write(text if str(text).endswith("\n") else f"{text}\n")
+
+    def text(self):
+        return self._buf.getvalue()
+
+    def warnings(self):
+        """Run-level warnings: [warn]/[error] lines, failed [QA] checks and
+        Python warnings, in the order they appeared."""
+        out = []
+        for line in self.text().splitlines():
+            t = line.strip()
+            if (t.startswith("[warn]") or t.startswith("[error]")
+                    or (t.startswith("[QA]") and "WARN" in t)
+                    or re.search(r"\b\w*Warning: ", t)):
+                out.append(t)
+        return out
+
+    def path(self):
+        return None if self.target is None else Path(self.target) / self.NAME
+
+    def dump(self):
+        p = self.path()
+        if p is None:
+            return None
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            head = (f"CONSOLA — process_adcp_bathimetric v{__version__}   "
+                    f"{datetime.datetime.now().isoformat(timespec='seconds')}\n"
+                    f"comando: {' '.join(sys.argv)}\n\n")
+            p.write_text(head + self.text(), encoding="utf-8")
+            return p
+        except Exception:
+            return None
+
+
 def main():
+    runlog = RunLog().start()
+    try:
+        _run(runlog)
+    except SystemExit as e:
+        if e.code not in (None, 0) and not isinstance(e.code, int):
+            runlog.note(str(e.code))
+        raise
+    except KeyboardInterrupt:
+        runlog.note("[error] interrupted by the user (Ctrl+C)")
+        raise
+    except BaseException as e:
+        runlog.note(f"[error] unhandled exception: {e!r} — traceback follows")
+        runlog.note(traceback.format_exc())
+        raise
+    finally:
+        if runlog.path() is not None:
+            print(f"[log] console transcript: {runlog.path()}")
+        runlog.stop()
+        runlog.dump()
+
+
+def _run(runlog):
     # Two-phase parse: read --config first so it can supply defaults that the
     # command line then overrides (precedence: CLI > config file > built-in).
     pre = argparse.ArgumentParser(add_help=False)
@@ -3959,11 +5443,15 @@ def main():
 
     parser = build_parser()
     campania, river_offsets, manual_groups = {}, {}, {}
+    config_log: list[str] = []
     if pre_args.config:
-        cfg_params, campania, river_offsets, manual_groups = load_config(pre_args.config)
+        cfg_params, campania, river_offsets, manual_groups = load_config(
+            pre_args.config, parser=parser, log=config_log)
         parser.set_defaults(**cfg_params)
     args = parser.parse_args()
     args.manual_groups = manual_groups        # v6: [grupos] override
+    args.manual_rivers = (load_river_overrides(pre_args.config)   # 6.1: [rios]
+                          if pre_args.config else {})
     datum_name = args.datum_name
 
     if not args.matfiles:
@@ -3976,19 +5464,40 @@ def main():
         if not m.exists():
             sys.exit(f"[error] file not found: {m}")
 
-    setup_log: list[str] = [f"[info] process_adcp_bathimetric v{__version__}"]
+    # 6.1: output locations are known from here on, so the console transcript
+    # is saved even if the run stops during setup.
+    survey_mode = len(matfiles) > 1
+    if survey_mode:
+        survey_name = args.survey_name or f"salida_{matfiles[0].stem}"
+        survey_root = Path(args.outdir) if args.outdir else Path.cwd() / survey_name
+        resumen = survey_root / "_resumen"
+        runlog.target = resumen
+    else:
+        survey_root = resumen = None
+        runlog.target = (Path(args.outdir) if args.outdir
+                         else Path.cwd() / f"out_{matfiles[0].stem}")
 
-    # --- GNSS water-surface points (parsed once; orientation + primary profile) ---
-    ws_points_native = None
+    setup_log: list[str] = [f"[info] process_adcp_bathimetric v{__version__}"] + config_log
+    ws_requested = bool(args.water_surface_csv) or bool(args.stations and args.readings)
+
+    # --- GNSS water-surface points (parsed once; orientation + primary surface) --
+    ws_table, ws_skipped = None, []
     if args.water_surface_csv:
         try:
-            ws_points_native = read_ws_csv(
-                args.water_surface_csv, args.ws_east_col, args.ws_north_col, args.ws_elev_col)
+            ws_table, ws_skipped, ws_cols = read_ws_table(
+                args.water_surface_csv, args.ws_east_col, args.ws_north_col,
+                args.ws_elev_col)
         except Exception as e:
             sys.exit(f"[error] could not read water-surface CSV: {e}")
+        setup_log.append(
+            f"[info] WS CSV: {len(ws_table)} point(s) read (E={ws_cols['east']}, "
+            f"N={ws_cols['north']}, H={ws_cols['elev']}, id={ws_cols['id'] or 'row#'}, "
+            f"CRS {args.ws_crs})"
+            + (f"; {len(ws_skipped)} unreadable row(s)" if ws_skipped else ""))
 
     # --- river network (multi-river centerline) --------------------------- #
     network = None
+    ws_pts_net = None
     if args.centerline:
         if not HAS_GPD:
             sys.exit("[error] --centerline needs geopandas/shapely installed")
@@ -3996,13 +5505,17 @@ def main():
             net_crs = gpd.read_file(args.centerline).crs
         except Exception as e:
             sys.exit(f"[error] could not read centerline: {e}")
-        ws_xy_elev = None
-        if ws_points_native is not None:
+        if ws_table is not None:
             if net_crs is not None and CRS.from_user_input(args.ws_crs) != net_crs:
                 tr = Transformer.from_crs(args.ws_crs, net_crs, always_xy=True)
-                ws_xy_elev = [(*tr.transform(x, y), h) for (x, y, h) in ws_points_native]
+                ws_pts_net = []
+                for p in ws_table:
+                    x, y = tr.transform(p["x"], p["y"])
+                    ws_pts_net.append(dict(p, x=float(x), y=float(y)))
             else:
-                ws_xy_elev = list(ws_points_native)
+                ws_pts_net = [dict(p) for p in ws_table]
+        ws_xy_elev = ([(p["x"], p["y"], p["h"]) for p in ws_pts_net]
+                      if ws_pts_net else None)
         try:
             network = RiverNetwork(
                 args.centerline, crs_override=None, reverse=args.chainage_reverse,
@@ -4013,37 +5526,21 @@ def main():
         for ax in network.axes:
             network.river_offsets.setdefault(ax.river, float(args.chainage_offset))
 
-    # --- survey chain (continuous internal chainage across surveyed rivers) - #
+    # --- 6.1: transects located from their GPS (section crossing), paths ranked
+    # for display only — the water surface needs no trunk.
+    prescan = []
     if network is not None:
-        if ws_xy_elev:
-            rivers_present = list(dict.fromkeys(
-                network.locate(x, y)["river"] for (x, y, _h) in ws_xy_elev))
-        else:
-            rivers_present = [ax.river for ax in network.axes]
-        network.build_survey_chain(rivers_present)
-
-    # --- primary water-surface profile (on the continuous survey chainage) -- #
-    wsp = None
-    if ws_points_native is not None:
-        if network is None:
-            setup_log.append("[warn] --water-surface-csv ignored: needs --centerline")
-        else:
-            pairs, skipped = [], 0
-            for (x, y, h) in ws_xy_elev:
-                loc = network.locate(x, y)
-                sc = network.survey_chainage(loc["river"], loc["km_internal"])
-                if sc is None:
-                    skipped += 1
-                    continue
-                pairs.append((sc, h, loc["dist"]))
-            if skipped:
-                setup_log.append(f"[warn] {skipped} WS point(s) off the survey chain "
-                                 "— ignored for the profile")
-            try:
-                wsp = WaterSurfaceProfile(pairs, log=setup_log)
-            except Exception as e:
-                setup_log.append(f"[warn] could not build GNSS water-surface profile: {e}")
-                wsp = None
+        if args.manual_rivers:
+            setup_log.append("[info] [rios] overrides: " + ", ".join(
+                f"{k} -> {v}" for k, v in args.manual_rivers.items()))
+            stems = {m.stem for m in matfiles}
+            for k in args.manual_rivers:
+                if k not in stems:
+                    setup_log.append(f"[warn] [rios] {k}: no transect with that id among "
+                                     "the inputs — override unused")
+        prescan = prescan_transects(matfiles, network, args=args, log=setup_log)
+        network.rank_paths([(t["river"], t["km_internal"]) for t in prescan],
+                           log=setup_log)
 
     # --- hydrometric stations (secondary water surface) -------------------- #
     station_ws = None
@@ -4057,41 +5554,87 @@ def main():
             try:
                 registry = StationRegistry(args.stations, network,
                                            crs_override=args.ws_crs, log=setup_log)
-                registry.attach_survey_chainage(network)
                 mode, rdata = read_level_readings(args.readings)
                 station_ws = StationWS(registry, mode, rdata, log=setup_log)
             except Exception as e:
                 setup_log.append(f"[warn] could not build station water surface: {e}")
                 station_ws = None
 
+    # --- water-surface model (GNSS + gauges on the network paths) ---------- #
+    wsm = None
+    if network is not None and (ws_pts_net or station_ws is not None):
+        wsm = WaterSurfaceModel(network, points=ws_pts_net, station_ws=station_ws,
+                                qc_tol=args.ws_qc_tol, skipped=ws_skipped,
+                                log=setup_log, extrap_tol=args.ws_extrap_tol)
+    elif ws_table is not None and network is None:
+        setup_log.append("[warn] --water-surface-csv ignored: needs --centerline")
+
+    # --- 6.1: coverage check BEFORE processing (no silent relative output) - #
+    no_ws = []
+    for t in prescan:
+        res = (wsm.resolve(t["river"], t["km_internal"]) if wsm is not None
+               else dict(ws_elev=None, note="no water-surface model"))
+        if res["ws_elev"] is None:
+            no_ws.append(f"{t['perfil']} ({t['river']} km "
+                         f"{format_progresiva(t['km_oficial'])}: {res['note']})")
+    fatal = None
+    if ws_requested and not args.water_surface_elev:
+        if wsm is None or not wsm.has_anchors():
+            fatal = "no usable GNSS point or gauge reading"
+        elif prescan and len(no_ws) == len(prescan):
+            fatal = (f"none of the {len(prescan)} transects lies on a network path "
+                     "carrying a water-surface value")
+    if no_ws and not fatal:
+        setup_log.append(f"[warn] {len(no_ws)} of {len(prescan)} transect(s) will get NO "
+                         "water surface (RELATIVE bed):")
+        setup_log += [f"[warn]   - {x}" for x in no_ws]
+
     if setup_log:
         print("\n".join(setup_log))
         print()
+    if wsm is not None:
+        try:
+            Path(runlog.target).mkdir(parents=True, exist_ok=True)
+            qcp = wsm.write_csv(Path(runlog.target) / "water_surface_qc.csv")
+            print(f"[ok ] {qcp}")
+        except Exception as e:
+            print(f"[warn] could not write water_surface_qc.csv: {e}")
+    if fatal:
+        msg = (f"[error] a water-surface source is configured but {fatal}: every bed "
+               f"elevation would be RELATIVE, not {datum_name}. See the [warn] lines "
+               "above" + (" and water_surface_qc.csv" if wsm is not None else "")
+               + "; fix the inputs, or set 'allow-relative = true' (--allow-relative) "
+               "to continue anyway.")
+        if args.allow_relative:
+            print(msg.replace("[error]", "[warn]", 1) + "  -> continuing (allow-relative)")
+        else:
+            sys.exit(msg)
 
     # =============================== single transect ======================= #
-    if len(matfiles) == 1:
-        r = process_one(matfiles[0], args, network=network, wsp=wsp,
+    if not survey_mode:
+        r = process_one(matfiles[0], args, network=network, wsp=wsm,
                         station_ws=station_ws, datum_name=datum_name)
         if r is not None:
             rec = write_run_record(r["outdir"], args, campania, matfiles,
-                                   river_offsets=river_offsets)
+                                   river_offsets=river_offsets, setup_lines=setup_log,
+                                   warn_lines=runlog.warnings(),
+                                   transect_warn_lines=collect_transect_warnings([r]),
+                                   log_name=RunLog.NAME)
             print(f"[ok ] {rec.name}")
         return
 
     # =============================== survey mode =========================== #
-    survey_name = args.survey_name or f"salida_{matfiles[0].stem}"
-    survey_root = Path(args.outdir) if args.outdir else Path.cwd() / survey_name
     survey_root.mkdir(parents=True, exist_ok=True)
-    resumen = survey_root / "_resumen"
     resumen.mkdir(parents=True, exist_ok=True)
 
     print(f"[survey] {len(matfiles)} transects -> {survey_root}")
     results = []
     for i, m in enumerate(matfiles, 1):
-        r = process_one(m, args, network=network, wsp=wsp, station_ws=station_ws,
+        r = process_one(m, args, network=network, wsp=wsm, station_ws=station_ws,
                         datum_name=datum_name, survey_outdir=survey_root, quiet=True)
         if r is None:
-            print(f"  [{i}/{len(matfiles)}] {m.name}: FAILED (see log)")
+            print(f"  [{i}/{len(matfiles)}] {m.name}: FAILED "
+                  f"(see {Path(m.stem) / 'process_log.txt'})")
             continue
         print(f"  [{i}/{len(matfiles)}] {_line_label(r)}")
         results.append(r)
@@ -4105,6 +5648,7 @@ def main():
     # untouched for traceability, but from here on every aggregate — index,
     # longitudinal profile, plan view, shapefiles, merged point cloud — sees
     # ONLY the group profiles, so a 4-repetition aforo appears once.
+    all_transects = list(results)
     group_log: list[str] = []
     groups = group_transects(results, args, log=group_log)
     for line in group_log:
@@ -4114,7 +5658,7 @@ def main():
         if len(g) == 1:
             aggregated.append(g[0])
             continue
-        gr = process_group(g, args, network=network, wsp=wsp,
+        gr = process_group(g, args, network=network, wsp=wsm,
                            station_ws=station_ws, datum_name=datum_name,
                            survey_outdir=survey_root)
         print(f"  [grupo] {gr['perfil']}: {gr['n_reps']} repeticiones -> "
@@ -4131,6 +5675,17 @@ def main():
         print(f"[ok ] {qc.relative_to(survey_root)}")
     results = aggregated
 
+    # 6.1: water-surface source tally — the first thing to check in a campaign
+    tally = {}
+    for r in results:
+        k = r.get("ws_source") or "none"
+        tally[k] = tally.get(k, 0) + 1
+    ws_line = ("[info] pelo de agua por perfil: "
+               + ", ".join(f"{k} {v}" for k, v in sorted(tally.items())))
+    print(ws_line)
+    if tally.get("none"):
+        print(f"[warn] {tally['none']} perfil(es) SIN pelo de agua: cotas RELATIVAS")
+
     # aggregates
     idx = write_survey_index(results, resumen, datum_name)
     prof = write_survey_profiles(results, resumen)
@@ -4138,7 +5693,7 @@ def main():
     print(f"[ok ] {prof.relative_to(survey_root)}")
     pv = plot_survey_planview(results, network, resumen)
     print(f"[ok ] {pv.relative_to(survey_root)}")
-    lp = plot_long_profile(results, wsp, resumen, datum_name)
+    lp = plot_long_profile(results, wsm, resumen, datum_name, network=network)
     if lp:
         print(f"[ok ] {lp.relative_to(survey_root)}")
     if HAS_GPD:
@@ -4152,11 +5707,15 @@ def main():
             print(f"[ok ] {cloud.relative_to(survey_root)}")
 
     # traceability record for the whole survey
-    summary = [f"[resumen] {len(results)} transectas procesadas:"]
+    summary = [ws_line, "", f"[resumen] {len(results)} transectas procesadas:"]
     for r in sorted(results, key=_sort_key):
         summary.append("    " + _line_label(r))
+    twarn = collect_transect_warnings(
+        all_transects + [r for r in results if r.get("is_group")])
     rec = write_run_record(resumen, args, campania, matfiles,
-                           extra_lines=summary, river_offsets=river_offsets)
+                           extra_lines=summary, river_offsets=river_offsets,
+                           setup_lines=setup_log, warn_lines=runlog.warnings(),
+                           transect_warn_lines=twarn, log_name=RunLog.NAME)
     print(f"[ok ] {rec.relative_to(survey_root)}")
 
     print(f"\n[done] survey outputs in: {survey_root}")
