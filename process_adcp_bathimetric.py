@@ -237,6 +237,9 @@ from scipy.signal import savgol_filter
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.text import Text as MplText
+from matplotlib.ticker import FuncFormatter
 
 from pyproj import CRS, Transformer
 
@@ -254,7 +257,7 @@ except Exception as e:
 DATUM_NAME_DEFAULT = "IGN SRVN16"
 
 # Script version (reported in logs and the traceability record).
-__version__ = "6.1"
+__version__ = "6.2"
 
 # 6.1: water-surface extrapolation beyond the last value of a path (slope
 # continuation) is reported as a WARNING only past this distance [m]; shorter
@@ -266,6 +269,12 @@ WS_EXTRAP_TOL_DEFAULT = 200.0
 # path is a least-squares fit over the values nearest to that end, taken until
 # they span at least this distance [m] (and at least two values).
 WS_SLOPE_WINDOW = 1000.0
+# 6.2: a slope is only defined over a real distance and inside a physical band.
+# v6.1 accepted any pair >= 1 m apart: two gauges 1.7 m apart with a 0.41 m
+# difference gave -241 m/km, i.e. 482 m of error 2 km downstream.
+WS_SLOPE_MIN_SPAN_DEFAULT = 200.0        # [m]
+WS_SLOPE_MAX_DEFAULT = 2.0               # [m/km] — Neuquén/Limay/Negro run
+                                         # 0.55-1.0 m/km, so 2.0 is generous
 
 # 6.1: a GNSS water-surface point whose second-nearest river axis is within this
 # margin [m] of the nearest one is flagged as AMBIGUOUS in water_surface_qc.csv
@@ -352,6 +361,14 @@ def extract_data(mat: dict) -> dict:
     utm        = get_field(gps, "UTM")
     lat        = np.asarray(get_field(gps, "Latitude"), dtype=float)
     lon        = np.asarray(get_field(gps, "Longitude"), dtype=float)
+    utm        = np.asarray(utm, dtype=float) if utm is not None else None
+
+    # 6.2: RiverSurveyor writes 0/0 — not NaN — when it loses the GNSS fix, and
+    # 0/0 is finite, so v6.1 used it as a boat position, fed it to the beam
+    # cloud and averaged it into the lat/lon that pick the UTM zone and the
+    # POSGAR faja (one dropout among two good samples flipped 19S -> 23S and
+    # faja 2 -> faja 7). Invalidated here, once, before anything else reads it.
+    lat, lon, utm, n_nofix = _mask_gnss_dropouts(lat, lon, utm)
 
     heading    = np.asarray(
         get_field(sysd, "True_North_ADP_Heading",
@@ -418,14 +435,43 @@ def extract_data(mat: dict) -> dict:
         bt_freq=bt_freq,
         bt_depth=bt_depth,
         summary_depth=summary_depth,
-        utm=np.asarray(utm, dtype=float) if utm is not None else None,
-        lat=lat, lon=lon,
+        utm=utm,
+        lat=lat, lon=lon, n_nofix=int(n_nofix),
         heading=heading, pitch=pitch, roll=roll,
         time=time, step=step,
         mean_vel=mean_vel,
         edge_left=edge_left, edge_right=edge_right, start_edge=start_edge,
         sensor_depth=sensor_depth, depth_reference=depth_reference,
     )
+
+
+def _mask_gnss_dropouts(lat, lon, utm):
+    """6.2: invalidate ensembles without a GNSS fix. Returns (lat, lon, utm,
+    n_dropped) with the bad entries set to NaN in every array, so downstream
+    code that already tests isfinite() skips them.
+
+    A dropout shows up as an exact 0/0 in GPS.UTM and/or Latitude/Longitude —
+    both are FINITE, which is why v6.1 let them through."""
+    lat = np.asarray(lat, dtype=float).ravel()
+    lon = np.asarray(lon, dtype=float).ravel()
+    n = lat.size
+    bad = ~np.isfinite(lat) | ~np.isfinite(lon) | ((lat == 0.0) & (lon == 0.0)) \
+        | (np.abs(lat) < 1e-9) | (np.abs(lon) < 1e-9)
+    if utm is not None:
+        u = np.asarray(utm, dtype=float)
+        if u.ndim == 2 and u.shape[0] == n and u.shape[1] >= 2:
+            ubad = ~np.isfinite(u[:, 0]) | ~np.isfinite(u[:, 1]) \
+                | ((u[:, 0] == 0.0) & (u[:, 1] == 0.0))
+            bad = bad | ubad
+            u = u.copy()
+            u[bad, :2] = np.nan
+            utm = u
+        else:
+            utm = None
+    lat = lat.copy(); lon = lon.copy()
+    lat[bad] = np.nan
+    lon[bad] = np.nan
+    return lat, lon, utm, int(np.count_nonzero(bad))
 
 
 def auto_utm_crs(lat: np.ndarray, lon: np.ndarray) -> CRS:
@@ -456,6 +502,105 @@ def auto_posgar07_crs(lon: np.ndarray) -> CRS:
     epsgs = [5343, 5344, 5345, 5346, 5347, 5348, 5349]
     idx = int(np.argmin([abs(lon_m - cm) for cm in cms]))
     return CRS.from_epsg(epsgs[idx])
+
+
+def crs_is_metric(crs) -> bool:
+    """True when `crs` is projected with linear units in metres."""
+    try:
+        c = CRS.from_user_input(crs)
+    except Exception:
+        return False
+    if c.is_geographic or not c.is_projected:
+        return False
+    try:
+        return all(ax.unit_name in ("metre", "meter", "m") for ax in c.axis_info[:2])
+    except Exception:
+        return True
+
+
+CRS_PLAUSIBLE_TOL = 1000.0          # [m] median distance to the network
+
+
+def check_crs_plausibility(xy, network, declared, label, log=None, src_crs=None):
+    """6.2: is `declared` really the CRS of these coordinates?
+
+    v6.1 transformed whatever was declared without ever asking. A faja-3 file
+    declared EPSG:5344 landed 739 km away; the 250 m rule then dropped every
+    point and the run stopped complaining that no transect had a water surface
+    — true, but three steps from the cause.
+
+    Measures the median distance of the points to the nearest axis; past
+    CRS_PLAUSIBLE_TOL it re-tests the POSGAR07 fajas and UTM 19S/20S and names
+    the one that puts the data on the river. Returns (ok, message)."""
+    log = log if log is not None else []
+    pts = [(float(x), float(y)) for x, y in xy
+           if np.isfinite(x) and np.isfinite(y)]
+    if not pts or network is None or not getattr(network, "axes", None):
+        return True, ""
+
+    def _median_dist(cand):
+        """Median distance to the nearest axis if the raw coordinates were in
+        `cand`. `xy` must be the coordinates AS READ, before any transform."""
+        qs = pts
+        if network.crs is not None and CRS.from_user_input(cand) != network.crs:
+            tr = Transformer.from_crs(cand, network.crs, always_xy=True)
+            xx, yy = tr.transform([p[0] for p in pts], [p[1] for p in pts])
+            qs = list(zip(xx, yy))
+        d = [min(ax.main.distance(Point(x, y)) for ax in network.axes) for x, y in qs]
+        return float(np.median(d))
+
+    d0 = _median_dist(declared)
+    if d0 <= CRS_PLAUSIBLE_TOL:
+        log.append(f"[info] {label}: mediana de distancia a la red = {d0:.0f} m "
+                   f"(CRS declarado {CRS.from_user_input(declared).to_string()})")
+        return True, ""
+    best, bd = None, d0
+    for epsg in (5343, 5344, 5345, 5346, 5347, 32719, 32720, 32718):
+        try:
+            d = _median_dist(CRS.from_epsg(epsg))
+        except Exception:
+            continue
+        if d < bd:
+            best, bd = epsg, d
+    msg = (f"{label}: sus puntos quedan a {d0 / 1000.0:.0f} km de la red con el CRS "
+           f"declarado ({CRS.from_user_input(declared).to_string()})")
+    if best is not None and bd <= CRS_PLAUSIBLE_TOL:
+        msg += (f". Con EPSG:{best} la mediana baja a {bd:.0f} m — revisá "
+                f"{src_crs or 'el CRS declarado'}")
+    else:
+        msg += ". Ninguna faja POSGAR07 ni zona UTM los pone sobre el cauce"
+    return False, msg
+
+
+def resolve_out_crs(cli_value, network_crs, log=None):
+    """6.2: THE coordinate reference system of every output of the run.
+
+    v6.1 chose a POSGAR faja per transect from its mean longitude while the
+    survey layers stamped EPSG:5344 unconditionally, so a transect east of
+    -67.5 deg (i.e. the whole Rio Negro below Chichinales) was written 739 km
+    off, silently. One CRS is resolved here, once, and everything — per-transect
+    CSV and shapefiles, survey layers, track cloud, plot axis labels — uses it.
+
+    Order: --out-crs, else the centerline's CRS, else EPSG:5344 with a warning.
+    It must be projected and metric; a geographic CRS would turn every chainage,
+    tolerance and distance in the pipeline into degrees."""
+    log = log if log is not None else []
+    if cli_value:
+        crs, why = CRS.from_user_input(cli_value), "--out-crs / out-crs"
+    elif network_crs is not None:
+        crs, why = CRS.from_user_input(network_crs), "CRS of the centerline"
+    else:
+        crs, why = CRS.from_epsg(5344), "fallback"
+        log.append("[warn] no --out-crs and the centerline has no CRS: outputs "
+                   "default to EPSG:5344 (POSGAR07 faja 2). Declare --out-crs "
+                   "(and --centerline-crs) if that is not what you surveyed.")
+    if not crs_is_metric(crs):
+        sys.exit(f"[error] output CRS {crs.to_string()} is not a projected metric "
+                 "CRS. Chainages, tolerances and distances would be in degrees. "
+                 "Set --out-crs to a projected CRS (e.g. EPSG:5344).")
+    log.append(f"[info] CRS de salida : {crs.name} "
+               f"(EPSG:{crs.to_epsg()}) — {why}")
+    return crs
 
 
 # ============================================================================ #
@@ -521,8 +666,9 @@ def compute_flow_direction(mean_vel: np.ndarray,
 SONTEK_EPOCH = datetime.datetime(2000, 1, 1)
 
 
-def sontek_time(data: dict):
-    """Absolute start time of a transect, or None if unavailable."""
+def sontek_time(data: dict, mode="auto", hint=None):
+    """Absolute start time of a transect, or None if unavailable (6.2: honours
+    --time-epoch and the file-name timestamp, like representative_time)."""
     t = np.asarray(data.get("time"), dtype=float)
     if t.size == 0 or not np.any(np.isfinite(t)):
         return None
@@ -530,10 +676,10 @@ def sontek_time(data: dict):
     # A plain sample counter (extract_data's fallback) is not a timestamp.
     if t0 < 1e6:
         return None
-    try:
-        return SONTEK_EPOCH + datetime.timedelta(seconds=t0)
-    except (OverflowError, ValueError):
+    dt = _decode_epoch(t0, mode=mode, hint=hint)
+    if dt is None:
         return None
+    return dt.astype("datetime64[us]").astype(datetime.datetime)
 
 
 def _ang_diff_180(a: float, b: float) -> float:
@@ -673,9 +819,25 @@ def merge_group_clouds(group):
     """
     keys = ("E", "N", "depth", "weight", "beam_index", "beam_freq_khz",
             "ens", "src", "primary")
+    # 6.2: every repetition is brought into the REFERENCE member's UTM zone
+    # first. v6.1 concatenated E/N raw: an aforo whose repetitions straddled
+    # lon -66 mixed zones 19S and 20S, a 517 km offset, silently. The tracks
+    # were already reprojected per member (process_group); the cloud was not.
+    ref_crs = next((r["utm_crs"] for r in group if r.get("cloud")), None)
     out = {}
     for k in keys:
-        parts = [np.asarray(r["cloud"][k]) for r in group if r.get("cloud")]
+        parts = []
+        for r in group:
+            if not r.get("cloud"):
+                continue
+            v = np.asarray(r["cloud"][k])
+            if k in ("E", "N") and ref_crs is not None \
+                    and CRS.from_user_input(r["utm_crs"]) != CRS.from_user_input(ref_crs):
+                tr = Transformer.from_crs(r["utm_crs"], ref_crs, always_xy=True)
+                e, n = tr.transform(np.asarray(r["cloud"]["E"]),
+                                    np.asarray(r["cloud"]["N"]))
+                v = np.asarray(e if k == "E" else n)
+            parts.append(v)
         out[k] = np.concatenate(parts) if parts else np.array([])
     # Tag each point with the repetition it came from, for the QC plot.
     rep = []
@@ -2630,12 +2792,20 @@ class WaterSurfaceModel:
     role, reason)."""
 
     def __init__(self, network, points=None, station_ws=None, qc_tol=0.10,
-                 skipped=None, log=None, extrap_tol=WS_EXTRAP_TOL_DEFAULT):
+                 skipped=None, log=None, extrap_tol=WS_EXTRAP_TOL_DEFAULT,
+                 slope_min_span=WS_SLOPE_MIN_SPAN_DEFAULT,
+                 slope_max=WS_SLOPE_MAX_DEFAULT / 1000.0, default_slope=None):
         self._log = log if log is not None else []
         self.network = network
         self.station_ws = station_ws
         self.qc_tol = float(qc_tol)
         self.extrap_tol = float(extrap_tol)
+        # 6.2: guards on the slope used to continue the surface (see _end_slope)
+        self.slope_min_span = float(slope_min_span)
+        self.slope_max = abs(float(slope_max))
+        self.default_slope = None if default_slope is None else float(default_slope)
+        self._def_slope = None
+        self._grid_cache = {}
         self.rows = []
         self.gnss, self.gauges, self.qc_gauges = [], [], []
         self._cache = {}
@@ -2848,33 +3018,69 @@ class WaterSurfaceModel:
         return False
 
     @staticmethod
-    def _end_slope(seq, end):
-        """Least-squares slope dh/dp [m/m] over the values nearest to one end of
-        `seq` ([(p, anchor)] ascending; end=0 upstream, -1 downstream), taken
-        until they span WS_SLOPE_WINDOW. A slope rising downstream is replaced
-        by the whole-path fit, else by 0. Returns (slope, description)."""
+    def _fit_slope(pts, min_span):
+        """(slope [m/m], span [m], n) over [(p, anchor)], or (None, span, n)
+        when the values do not span `min_span`."""
+        ps = np.asarray([q[0] for q in pts], dtype=float)
+        hs = np.asarray([q[1]["h"] for q in pts], dtype=float)
+        span = float(np.ptp(ps)) if ps.size else 0.0
+        if ps.size < 2 or span < min_span:
+            return None, span, int(ps.size)
+        return float(np.polyfit(ps, hs, 1)[0]), span, int(ps.size)
+
+    def _auto_default_slope(self):
+        """Fallback slope: the whole-path fit of the path whose anchors span the
+        most, cached. Used when a path cannot define a slope of its own."""
+        if self._def_slope is not None:
+            return self._def_slope
+        best = (0.0, 0.0, "flat: no path with enough water-surface values")
+        try:
+            per_path = self._solve(None)["per_path"]
+        except Exception:
+            per_path = []
+        for seq in per_path:
+            s, span, n = self._fit_slope(seq, self.slope_min_span)
+            if s is None or s > 0 or abs(s) > self.slope_max or span <= best[1]:
+                continue
+            best = (s, span, f"default slope of the run, {n} values over {span:.0f} m")
+        self._def_slope = (best[0], best[2])
+        return self._def_slope
+
+    def _end_slope(self, seq, end):
+        """Slope dh/dp [m/m] used to continue the surface beyond one end of
+        `seq` ([(p, anchor)] ascending; end=0 upstream, -1 downstream).
+
+        6.2, in order: (1) the values nearest that end, taken until they span
+        WS_SLOPE_WINDOW, accepted only if they span at least
+        --ws-slope-min-span; (2) the whole-path fit; (3) --ws-default-slope.
+        A slope outside the band [-ws-slope-max, 0] is rejected at every step.
+
+        v6.1 only required 1 m of separation and only rejected a RISING slope:
+        two gauges 1.7 m apart with 0.41 m between their zeros produced
+        -241 m/km, i.e. 482 m of error 2 km away. Returns (slope, why)."""
         if len(seq) < 2:
-            return 0.0, "flat: single value"
+            return 0.0, "flat: a single water-surface value on this path"
+        smax = self.slope_max
         order = range(len(seq)) if end == 0 else range(len(seq) - 1, -1, -1)
         pts = []
         for i in order:
             pts.append(seq[i])
             if len(pts) >= 2 and abs(pts[-1][0] - pts[0][0]) >= WS_SLOPE_WINDOW:
                 break
-        ps = np.asarray([q[0] for q in pts])
-        hs = np.asarray([q[1]["h"] for q in pts])
-        if np.ptp(ps) < 1.0:
-            return 0.0, "flat: coincident values"
-        slope = float(np.polyfit(ps, hs, 1)[0])
-        why = f"{len(pts)} values over {np.ptp(ps):.0f} m"
-        if slope > 0:
-            ps2 = np.asarray([q[0] for q in seq])
-            hs2 = np.asarray([q[1]["h"] for q in seq])
-            s2 = float(np.polyfit(ps2, hs2, 1)[0]) if np.ptp(ps2) >= 1.0 else 0.0
-            if s2 <= 0:
-                return s2, f"whole path, {len(seq)} values (end window rose)"
-            return 0.0, "flat: the surface rises downstream here"
-        return slope, why
+        s, span, n = self._fit_slope(pts, self.slope_min_span)
+        if s is not None and -smax <= s <= 0:
+            return s, f"{n} values over {span:.0f} m"
+        why_end = (f"the {len(pts)} values at this end span {span:.0f} m "
+                   f"(< {self.slope_min_span:.0f} m)" if s is None else
+                   (f"the end fit gives {s * 1000:+.1f} m/km, "
+                    + ("rising downstream" if s > 0 else
+                       f"outside +/-{smax * 1000:.1f} m/km")))
+        s2, span2, n2 = self._fit_slope(seq, self.slope_min_span)
+        if s2 is not None and -smax <= s2 <= 0:
+            return s2, f"whole path, {n2} values over {span2:.0f} m ({why_end})"
+        sd, whyd = (self.default_slope, "--ws-default-slope") \
+            if self.default_slope is not None else self._auto_default_slope()
+        return float(sd), f"{whyd} ({why_end}; the whole path does not resolve it either)"
 
     def _junction(self, J, anchors):
         """Stage at junction J from every incoming branch (see class doc)."""
@@ -2976,7 +3182,10 @@ class WaterSurfaceModel:
             pe, ae = seq[end]
             slope, why = self._end_slope(seq, end)
             dist = p - pe
-            tag = "EXTRAP" if abs(dist) > self.extrap_tol else "extrap"
+            # 6.2: any extrapolation that could not use the end window is a
+            # WARNING regardless of distance — the slope itself is the doubt
+            weak = ("default slope" in why) or ("whole path" in why) or ("flat:" in why)
+            tag = "EXTRAP" if (abs(dist) > self.extrap_tol or weak) else "extrap"
             side = "upstream of" if dist < 0 else "downstream of"
             note = (f"{tag} {abs(dist):.0f} m {side} {ae['id']} at "
                     f"{slope * 1000.0:+.2f} m/km ({why})")
@@ -3032,6 +3241,48 @@ class WaterSurfaceModel:
         return out
 
     # -------------------------------------------------------------- plots
+    def resolve_series(self, river, km_internal, when=None, step=1.0):
+        """6.2: water surface for MANY points of one river at once.
+
+        resolve() is evaluated on a 1 m chainage grid spanning the request and
+        the result is interpolated, so a 20 000-point track costs O(km), not
+        O(points). The model is piecewise linear with breakpoints at the
+        anchors, and the anchors' own chainages are added to the grid, so the
+        interpolation is exact, not an approximation.
+
+        Returns (elev, source, note) as arrays/lists of len(km_internal);
+        elev is NaN where the model has no value."""
+        km = np.asarray(km_internal, dtype=float)
+        out = np.full(km.shape, np.nan)
+        src = np.array([""] * km.size, dtype=object)
+        note = np.array([""] * km.size, dtype=object)
+        ok = np.isfinite(km)
+        if not ok.any():
+            return out, src, note
+        lo, hi = float(np.nanmin(km)), float(np.nanmax(km))
+        key = (str(river), round(lo, 1), round(hi, 1), str(when))
+        if key not in self._grid_cache:
+            g = list(np.arange(lo, hi + step, step)) if hi > lo else [lo]
+            for a in self.gnss + self.gauges:
+                if a.get("river") == river and lo - step <= a["s"] <= hi + step:
+                    g.append(float(a["s"]))
+            g = np.unique(np.asarray(g + [lo, hi], dtype=float))
+            vals, srcs, notes = [], [], []
+            for s in g:
+                r = self.resolve(river, float(s), when)
+                vals.append(np.nan if r["ws_elev"] is None else float(r["ws_elev"]))
+                srcs.append(r["source"]); notes.append(r["note"])
+            self._grid_cache[key] = (g, np.asarray(vals), srcs, notes)
+        g, vals, srcs, notes = self._grid_cache[key]
+        good = np.isfinite(vals)
+        if good.any():
+            out[ok] = np.interp(km[ok], g[good], vals[good],
+                                left=np.nan, right=np.nan)
+        idx = np.clip(np.searchsorted(g, km, side="left"), 0, len(g) - 1)
+        src[ok] = [srcs[i] for i in idx[ok]]
+        note[ok] = [notes[i] for i in idx[ok]]
+        return out, src, note
+
     def path_series(self, pi, p_values):
         """Water surface along path `pi` at chainages `p_values` (mean stages)."""
         seq = self._solve(None)["per_path"][pi]
@@ -3082,16 +3333,65 @@ def _ws_is_warn(source, note) -> bool:
             or n.startswith("single"))
 
 
-def representative_time(data):
-    """Best-effort representative datetime for a transect from System.Time.
-    Returns np.datetime64 or None.
+def _stem_timestamp(name):
+    """datetime from a RiverSurveyor file stem 'YYYYMMDDhhmmss', or None."""
+    if not name:
+        return None
+    digits = "".join(ch for ch in str(Path(name).stem) if ch.isdigit())
+    if len(digits) < 14:
+        return None
+    try:
+        return datetime.datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
 
-    SonTek time units vary by export/config (MATLAB datenum, Unix s or ms), and
-    the timezone may be UTC or local — so this only handles the common encodings
-    heuristically and returns None when unsure, in which case station time-series
-    matching falls back to the per-station series mean (see StationWS). UNTESTED
-    against real .mat time: confirm the encoding/timezone per instrument before
-    relying on time-series station matching."""
+
+def _decode_epoch(v, mode="auto", hint=None):
+    """6.2: decode a System.Time value into np.datetime64.
+
+    The encodings genuinely OVERLAP — 2.0e8..2e9 is SonTek 2006-2063 and Unix
+    1976-2033 — so v6.1's branch ORDER could not resolve it: a Unix stamp from
+    2026 (1.79e9) was read as 2056. `mode` forces an encoding; 'auto' builds
+    every plausible candidate and keeps the one within 7 days of `hint` (the
+    file-name timestamp), falling back to SonTek, which is what RiverSurveyor
+    Live writes and what sontek_time() verified against the file names."""
+    cands = {}
+    if 1e7 < v < 4e9:
+        try:
+            cands["sontek"] = SONTEK_EPOCH + datetime.timedelta(seconds=v)
+        except (OverflowError, ValueError):
+            pass
+    if 6e5 < v < 8e5:
+        try:
+            cands["datenum"] = (datetime.datetime.fromordinal(int(v) - 366)
+                                + datetime.timedelta(days=v % 1.0))
+        except Exception:
+            pass
+    if 3e8 < v < 4e9:
+        cands["unix"] = datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=v)
+    if 3e11 < v < 4e12:
+        cands["unix_ms"] = (datetime.datetime(1970, 1, 1)
+                            + datetime.timedelta(seconds=v / 1000.0))
+    mode = str(mode or "auto").lower()
+    if mode in ("sontek", "datenum", "unix"):
+        key = {"unix": "unix"}.get(mode, mode)
+        dt = cands.get(key) or cands.get("unix_ms" if mode == "unix" else key)
+        return np.datetime64(dt) if dt is not None else None
+    if hint is not None and cands:
+        near = [(abs((dt - hint).total_seconds()), dt) for dt in cands.values()]
+        near.sort()
+        if near[0][0] <= 7 * 86400:
+            return np.datetime64(near[0][1])
+    for key in ("sontek", "datenum", "unix", "unix_ms"):
+        if key in cands:
+            return np.datetime64(cands[key])
+    return None
+
+
+def representative_time(data, mode="auto", hint=None):
+    """Best-effort representative datetime for a transect from System.Time.
+    Returns np.datetime64 or None. See _decode_epoch for how the encoding is
+    resolved (6.2: --time-epoch, cross-checked against the file name)."""
     t = data.get("time")
     if t is None:
         return None
@@ -3100,27 +3400,7 @@ def representative_time(data):
     if t.size == 0:
         return None
     v = float(np.median(t))
-    # 6.1: RiverSurveyor System.Time is seconds since 2000-01-01, verified in
-    # sontek_time() against the file-name timestamp. 2026 is ~8.3e8 s, which fell
-    # between the datenum and Unix branches below, so this returned None and
-    # time-series gauges silently used their mean. Same epoch as sontek_time.
-    if 1e8 < v < 2e9:
-        try:
-            return np.datetime64(SONTEK_EPOCH + datetime.timedelta(seconds=v))
-        except (OverflowError, ValueError):
-            return None
-    if 6e5 < v < 8e5:                          # MATLAB datenum (days), year ~2000+
-        try:
-            dt = (datetime.datetime.fromordinal(int(v) - 366)
-                  + datetime.timedelta(days=v % 1.0))
-            return np.datetime64(dt)
-        except Exception:
-            return None
-    if 9e8 < v < 4e9:                          # Unix epoch seconds
-        return np.datetime64(int(round(v)), "s")
-    if 9e11 < v < 4e12:                        # Unix epoch milliseconds
-        return np.datetime64(int(round(v / 1000.0)), "s")
-    return None
+    return _decode_epoch(v, mode=mode, hint=hint)
 
 
 # ============================================================================ #
@@ -3328,8 +3608,11 @@ def export_csvs(outdir: Path, perfil_id: str, progresiva_m,
 
     path1 = outdir / "bathymetric_profile.csv"
     with open(path1, "w", encoding="utf-8") as f:
+        # 6.2: x_out/y_out — the run's output CRS, recorded in procesamiento.txt.
+        # 'x_posgar07' did not say WHICH faja, and v6.1 could change it per
+        # transect while the survey layers claimed 5344.
         f.write("perfil,progresiva_m,brazo,s_m,depth_m,ws_elev_m,bed_elev_m,"
-                "latitude_deg,longitude_deg,x_utm,y_utm,x_posgar07,y_posgar07\n")
+                "latitude_deg,longitude_deg,x_utm,y_utm,x_out,y_out\n")
         for i in range(len(s_grid)):
             f.write(f"{perfil_id},{prog_str},{brazo},{s_grid[i]:.4f},{depth_grid[i]:.4f},"
                     f"{ws_str},{bed_elev[i]:.4f},"
@@ -3350,11 +3633,13 @@ def export_raw_points(outdir: Path, perfil_id: str, cloud: dict, s_pts: np.ndarr
 
     path = outdir / "raw_bed_points.csv"
     with open(path, "w", encoding="utf-8") as f:
-        f.write("perfil,s_m,depth_m,beam_index,beam_freq_khz,"
-                "x_utm,y_utm,latitude_deg,longitude_deg,x_posgar07,y_posgar07\n")
+        f.write("perfil,s_m,depth_m,beam_index,beam_id,beam_freq_khz,"
+                "x_utm,y_utm,latitude_deg,longitude_deg,x_out,y_out\n")
         for i in range(len(s_pts)):
+            _b = int(cloud["beam_index"][i])
             f.write(f"{perfil_id},{s_pts[i]:.4f},{cloud['depth'][i]:.4f},"
-                    f"{int(cloud['beam_index'][i])},{cloud['beam_freq_khz'][i]:.0f},"
+                    f"{_b},{'VB' if _b == 0 else 'B' + str(_b)},"
+                    f"{cloud['beam_freq_khz'][i]:.0f},"
                     f"{cloud['E'][i]:.4f},{cloud['N'][i]:.4f},"
                     f"{lat[i]:.8f},{lon[i]:.8f},"
                     f"{xp[i]:.4f},{yp[i]:.4f}\n")
@@ -3471,68 +3756,97 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
                         beam_idx: np.ndarray,
                         s_grid: np.ndarray, depth_grid: np.ndarray,
                         brazo: str = "", ws_elev=None,
-                        datum_name: str = DATUM_NAME_DEFAULT):
-    """Cross-section: slant beams in one translucent colour; VB distinct.
+                        datum_name: str = DATUM_NAME_DEFAULT,
+                        river: str = ""):
+    """Cross-section: beam cloud + smoothed bed.
 
     If `ws_elev` is given, the vertical axis is ABSOLUTE elevation in the datum
     (bed and beams plotted as ws_elev - depth, water surface drawn at ws_elev).
     Otherwise the axis is relative to the water surface (0 = surface).
+
+    6.2 layout rule: NOTHING but data inside the axes. v6.1 put two bold boxed
+    MI/MD labels at 98% of the plot height and a 3-column legend on top of the
+    bed fill, which is what made the figure unreadable on narrow sections. The
+    bank labels now sit above the axes, the legend below them, and the numbers
+    that used to be buried in the log are on the subtitle line.
     (All on-plot text in Spanish.)"""
-    fig, ax = plt.subplots(figsize=(11, 5.5))
+    fig, ax = plt.subplots(figsize=(11, 5.4))
 
     absolute = ws_elev is not None
     e0 = float(ws_elev) if absolute else 0.0        # water-surface level on the plot
-    y_bed  = e0 - depth_grid
+    y_bed = e0 - depth_grid
     y_surf = e0
-    y_floor = float(np.nanmin(y_bed)) - 0.5
-
-    # Bed fill + water column
-    ax.fill_between(s_grid, y_bed, y_floor,
-                    color="#7a5230", alpha=0.5, zorder=1, label="Lecho (relleno)")
-    ax.fill_between(s_grid, y_surf, y_bed,
-                    color="#cfe6f5", alpha=0.6, zorder=0, label="Columna de agua")
-
-    # Raw beam footprints: slant beams unified (single colour, more transparent),
-    # vertical beam kept distinct.
-    m_lat = beam_idx > 0
-    m_vb  = beam_idx == 0
-    if np.any(m_lat):
-        ax.scatter(s_pts[m_lat], e0 - depth_pts[m_lat], s=8, c="#5b7fa6",
-                   alpha=0.20, label="Beams laterales", zorder=2)
-    if np.any(m_vb):
-        ax.scatter(s_pts[m_vb], e0 - depth_pts[m_vb], s=16, c="black",
-                   alpha=0.75, label="Beam vertical (VB)", zorder=3)
-
-    # Smoothed bed
-    ax.plot(s_grid, y_bed, "k-", lw=2.0, label="Lecho suavizado", zorder=4)
-
-    # Bank annotations (MI = margen izquierda, MD = margen derecha)
+    y_floor = float(np.nanmin(y_bed)) - 0.6
     s0, s1 = float(s_grid[0]), float(s_grid[-1])
-    span = y_surf - y_floor
-    ax.axvline(s0, color="dimgray", lw=1, ls=":", alpha=0.7)
-    ax.axvline(s1, color="dimgray", lw=1, ls=":", alpha=0.7)
-    ax.text(s0, y_floor + 0.98 * span, "MI\n(margen izq.)",
-            ha="left", va="top", fontsize=11, fontweight="bold", color="black",
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.85))
-    ax.text(s1, y_floor + 0.98 * span, "MD\n(margen der.)",
-            ha="right", va="top", fontsize=11, fontweight="bold", color="black",
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.85))
+    span = max(y_surf - y_floor, 1e-6)
+
+    ax.fill_between(s_grid, y_surf, y_bed, color="#cfe6f5", alpha=0.55, lw=0, zorder=0)
+    ax.fill_between(s_grid, y_bed, y_floor, color="#7a5230", alpha=0.30, lw=0, zorder=1)
+
+    m_lat = beam_idx > 0
+    m_vb = beam_idx == 0
+    if np.any(m_lat):
+        ax.scatter(s_pts[m_lat], e0 - depth_pts[m_lat], s=5, c="#5b7fa6",
+                   alpha=0.18, lw=0, zorder=2)
+    if np.any(m_vb):
+        ax.scatter(s_pts[m_vb], e0 - depth_pts[m_vb], s=9, c="#222222",
+                   alpha=0.65, lw=0, zorder=3)
+    ax.plot(s_grid, y_bed, "-", color="#1a1a1a", lw=1.6, zorder=4,
+            solid_capstyle="round")
+    ax.axhline(y_surf, color="#1f3b73", lw=1.1, ls="--", alpha=0.8, zorder=4)
+
+    # bank markers OUTSIDE the data area (x-axis transform, not data coords)
+    tx = ax.get_xaxis_transform()
+    ax.axvline(s0, color="0.55", lw=0.8, ls=":", alpha=0.8, zorder=1)
+    ax.axvline(s1, color="0.55", lw=0.8, ls=":", alpha=0.8, zorder=1)
+    ax.text(s0, 1.012, "MI · margen izquierda", transform=tx, ha="left",
+            va="bottom", fontsize=8.5, color="0.35")
+    ax.text(s1, 1.012, "margen derecha · MD", transform=tx, ha="right",
+            va="bottom", fontsize=8.5, color="0.35")
 
     ax.set_xlim(s0 - 0.5, s1 + 0.5)
-    ax.set_ylim(y_floor, y_surf + max(0.15, 0.05 * span))
+    ax.set_ylim(y_floor, y_surf + 0.10 * span)
     ax.set_xlabel("Distancia transversal, s [m]")
+    ax.set_ylabel(f"Cota {datum_name} [m]" if absolute
+                  else "Cota relativa a la superficie del agua [m]")
+    ax.grid(True, axis="y", alpha=0.22, lw=0.6)
+    ax.set_axisbelow(True)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+
+    head = "Sección transversal"
+    if river:
+        head += f" — Río {river}"
+    if progresiva_m is not None:
+        head += f", progresiva {format_progresiva(progresiva_m)}"
+    fig.suptitle(head, fontsize=12.5, fontweight="semibold", x=0.055, ha="left",
+                 y=0.975)
+    bits = [f"Perfil {perfil_id}"]
+    if brazo:
+        bits.append(f"brazo {brazo}")
+    bits.append(f"ancho {s1 - s0:.1f} m".replace(".", ","))
+    bits.append(f"prof. máx {float(np.nanmax(depth_grid)):.2f} m".replace(".", ","))
     if absolute:
-        ax.set_ylabel(f"Cota {datum_name} [m]")
-        surf_lbl = f"Superficie del agua ({y_surf:.2f} m {datum_name})"
+        _int = depth_grid > 1e-6
+        _th = float(np.nanmin(y_bed[_int])) if np.any(_int) else float(np.nanmin(y_bed))
+        bits.append(f"thalweg {_th:.2f} m".replace(".", ","))
+        bits.append(f"pelo de agua {y_surf:.2f} m {datum_name}".replace(".", ","))
     else:
-        ax.set_ylabel("Cota relativa a la superficie del agua [m]")
-        surf_lbl = "Superficie del agua"
-    ax.set_title("Sección transversal — nube de puntos y lecho suavizado\n"
-                 + _subtitle(perfil_id, progresiva_m, brazo))
-    ax.axhline(y_surf, color="navy", lw=1, ls="--", alpha=0.7, label=surf_lbl)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right", fontsize=8, ncol=3)
-    fig.tight_layout()
+        bits.append("cotas RELATIVAS (sin pelo de agua)")
+    ax.set_title("   ·   ".join(bits), fontsize=8.8, color="0.35", loc="left", pad=22)
+
+    handles = [
+        Line2D([], [], color="#1a1a1a", lw=1.6, label="Lecho"),
+        Line2D([], [], color="#1f3b73", lw=1.1, ls="--", label="Pelo de agua"),
+        Line2D([], [], marker="o", ls="", color="#222222", ms=4, alpha=0.7,
+               label="Haz vertical (VB)"),
+        Line2D([], [], marker="o", ls="", color="#5b7fa6", ms=4, alpha=0.5,
+               label="Haces laterales (BT)"),
+    ]
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.135),
+              ncol=4, fontsize=8.5, frameon=False, handletextpad=0.5,
+              columnspacing=2.2)
+    fig.subplots_adjust(left=0.075, right=0.985, top=0.845, bottom=0.185)
     path = outdir / "cross_section.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -3546,22 +3860,31 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
 def export_axis_shp(outdir: Path, perfil_id: str, progresiva_m,
                      axis_origin: tuple[float, float], theta_section: float,
                      s_grid_extent: tuple[float, float],
-                     utm_crs: CRS, brazo: str = ""):
-    """Write axis.shp (single LineString covering the full s-range)."""
+                     utm_crs: CRS, brazo: str = "", out_crs: CRS | None = None):
+    """Write axis.shp (single LineString covering the full s-range).
+
+    6.2: written in the run's output CRS, like every other layer. v6.1 stamped
+    the internal UTM zone here and EPSG:5344 on the survey layers, so one
+    campaign produced a deliverable in two or three different CRSs."""
     if not HAS_GPD:
         return None
     Ec, Nc = axis_origin
     ux, uy = math.cos(theta_section), math.sin(theta_section)
     s0, s1 = s_grid_extent
-    line = LineString([(Ec + s0 * ux, Nc + s0 * uy),
-                       (Ec + s1 * ux, Nc + s1 * uy)])
+    pts = [(Ec + s0 * ux, Nc + s0 * uy), (Ec + s1 * ux, Nc + s1 * uy)]
+    out_crs = out_crs or utm_crs
+    if CRS.from_user_input(out_crs) != CRS.from_user_input(utm_crs):
+        tr = Transformer.from_crs(utm_crs, out_crs, always_xy=True)
+        xs, ys = tr.transform([p[0] for p in pts], [p[1] for p in pts])
+        pts = list(zip(xs, ys))
+    line = LineString(pts)
     gdf = gpd.GeoDataFrame(
         {"perfil": [perfil_id],
          "progr_m": [np.nan if progresiva_m is None else float(progresiva_m)],
          "brazo": [brazo],
          "theta_deg": [math.degrees(theta_section)],
          "length_m": [s1 - s0]},
-        geometry=[line], crs=utm_crs,
+        geometry=[line], crs=out_crs,
     )
     path = outdir / "axis.shp"
     gdf.to_file(path)
@@ -3571,6 +3894,7 @@ def export_axis_shp(outdir: Path, perfil_id: str, progresiva_m,
 def export_profile_points_shp(outdir: Path, perfil_id: str, progresiva_m,
                               geo: dict, utm_crs: CRS, posgar_crs: CRS,
                               brazo: str = "", ws_elev=None):
+    """profile_points.shp — 6.2: geometry and CRS are the run's output CRS."""
     if not HAS_GPD:
         return None
     s_m       = geo["s_m"]
@@ -3581,7 +3905,7 @@ def export_profile_points_shp(outdir: Path, perfil_id: str, progresiva_m,
     xp        = geo["xp"];  yp  = geo["yp"]
     prog_val  = np.nan if progresiva_m is None else float(progresiva_m)
     ws_val    = np.nan if ws_elev is None else float(ws_elev)
-    geom = [Point(E[i], N[i]) for i in range(len(s_m))]
+    geom = [Point(xp[i], yp[i]) for i in range(len(s_m))]
     gdf = gpd.GeoDataFrame({
         "perfil": perfil_id,
         "progr_m": prog_val,
@@ -3590,8 +3914,8 @@ def export_profile_points_shp(outdir: Path, perfil_id: str, progresiva_m,
         "ws_elev_m": ws_val, "bed_elev_m": bed_elev,
         "lat": lat, "lon": lon,
         "x_utm": E, "y_utm": N,
-        "x_posgar07": xp, "y_posgar07": yp,
-    }, geometry=geom, crs=utm_crs)
+        "x_out": xp, "y_out": yp,
+    }, geometry=geom, crs=posgar_crs)
     path = outdir / "profile_points.shp"
     gdf.to_file(path)
     return path
@@ -3607,18 +3931,21 @@ def export_raw_beam_points_shp(outdir: Path, perfil_id: str, cloud: dict, s_pts:
     lon, lat = tr_to_ll.transform(cloud["E"], cloud["N"])
     xp, yp   = tr_to_posgar.transform(cloud["E"], cloud["N"])
 
-    geom = [Point(cloud["E"][i], cloud["N"][i]) for i in range(len(s_pts))]
+    geom = [Point(xp[i], yp[i]) for i in range(len(s_pts))]
     gdf = gpd.GeoDataFrame({
         "perfil": perfil_id,
         "brazo": brazo,
         "s_m": s_pts,
         "depth_m": cloud["depth"],
         "beam_idx": cloud["beam_index"],
+        "beam_id": np.where(np.asarray(cloud["beam_index"]) == 0, "VB",
+                            np.char.add("B", np.asarray(
+                                cloud["beam_index"]).astype(str))),
         "freq_khz": cloud["beam_freq_khz"],
         "lat": lat, "lon": lon,
         "x_utm": cloud["E"], "y_utm": cloud["N"],
-        "x_posgar07": xp, "y_posgar07": yp,
-    }, geometry=geom, crs=utm_crs)
+        "x_out": xp, "y_out": yp,
+    }, geometry=geom, crs=posgar_crs)
     path = outdir / "raw_beam_points.shp"
     gdf.to_file(path)
     return path
@@ -3674,7 +4001,7 @@ def _manual_river(args, network, perfil_id, log=None):
     return river
 
 
-def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
+def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, out_crs=None,
                 datum_name: str = DATUM_NAME_DEFAULT,
                 survey_outdir: Path | None = None, quiet: bool = False):
     """
@@ -3725,15 +4052,55 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
     log.append(f"[info] edges   : L={data['edge_left']:.2f}m, R={data['edge_right']:.2f}m "
                f"(startEdge={data['start_edge']}; 0=Left, 1=Right)")
 
-    utm_crs    = auto_utm_crs(data["lat"], data["lon"])
-    posgar_crs = auto_posgar07_crs(data["lon"])
-    log.append(f"[info] UTM CRS    : {utm_crs.name} ({utm_crs.to_epsg()})")
-    log.append(f"[info] POSGAR07   : {posgar_crs.name} ({posgar_crs.to_epsg()})")
+    # 6.2: GNSS fix report BEFORE anything uses the positions
+    n_ens = int(len(data["vb_depth"]))
+    n_nofix = int(data.get("n_nofix", 0))
+    if n_nofix:
+        frac = n_nofix / max(n_ens, 1)
+        log.append(f"[warn] GNSS: {n_nofix}/{n_ens} ensambles sin fix "
+                   f"({100 * frac:.1f}%) — descartados (0/0 de RiverSurveyor)")
+        if frac > args.gps_max_gap and not args.allow_gps_gaps:
+            log.append(f"[error] más de {100 * args.gps_max_gap:.0f}% de la transecta "
+                       "sin posición GNSS: no se procesa (--allow-gps-gaps para forzar)")
+            try:
+                (outdir / "process_log.txt").write_text("\n".join(log) + "\n",
+                                                        encoding="utf-8")
+            except Exception:
+                pass
+            print("\n".join(log) if not quiet else f"    {log[-1]}")
+            return None
+    if not np.any(np.isfinite(data["lat"])):
+        log.append("[error] transect has no valid GNSS position at all")
+        print("\n".join(log) if not quiet else f"    {log[-1]}")
+        return None
 
-    if data["utm"] is not None and np.isfinite(data["utm"]).all():
-        utm = data["utm"]
-        log.append("[info] using GPS.UTM directly")
-    else:
+    utm_crs    = auto_utm_crs(data["lat"], data["lon"])
+    # 6.2: ONE output CRS for the whole run (see resolve_out_crs). The UTM zone
+    # above stays as the internal working frame in which the beam footprints and
+    # the section are built; it never reaches an output.
+    posgar_crs = out_crs if out_crs is not None else CRS.from_epsg(5344)
+    log.append(f"[info] UTM interno : {utm_crs.name} ({utm_crs.to_epsg()})")
+    log.append(f"[info] CRS salida  : {posgar_crs.name} (EPSG:{posgar_crs.to_epsg()})")
+    faja = auto_posgar07_crs(data["lon"])
+    if faja.to_epsg() != posgar_crs.to_epsg() and 5343 <= (posgar_crs.to_epsg() or 0) <= 5349:
+        log.append(f"[info] la faja POSGAR07 natural de esta transecta sería "
+                   f"EPSG:{faja.to_epsg()}; se escribe en {posgar_crs.to_epsg()} "
+                   "como todo el relevamiento")
+
+    utm = None
+    if data["utm"] is not None and np.ndim(data["utm"]) == 2 \
+            and np.isfinite(data["utm"]).any():
+        utm = np.array(data["utm"], dtype=float)
+        miss = ~np.isfinite(utm).all(axis=1)
+        fill = miss & np.isfinite(data["lat"]) & np.isfinite(data["lon"])
+        if fill.any():
+            tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
+            ex, ny = tr.transform(data["lon"][fill], data["lat"][fill])
+            utm[fill] = np.column_stack([ex, ny])
+        log.append("[info] using GPS.UTM directly"
+                   + (f" ({int(fill.sum())} ensambles reconstruidos de Lat/Lon)"
+                      if fill.any() else ""))
+    if utm is None:
         tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
         Ex, Ny = tr.transform(data["lon"], data["lat"])
         utm = np.column_stack([Ex, Ny])
@@ -3745,7 +4112,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
     # ------------------------------------------------- v6 depth spike filter
     data = filter_cloud_depths(data, enabled=(args.depth_filter != "off"), log=log)
 
-    t_start = sontek_time(data)
+    t_start = sontek_time(data, mode=getattr(args, "time_epoch", "auto"),
+                          hint=_stem_timestamp(matpath))
     if t_start is not None:
         log.append(f"[info] inicio de transecta: {t_start:%Y-%m-%d %H:%M:%S} "
                    f"(System.Time, época 2000-01-01)")
@@ -3969,7 +4337,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
     plot2 = plot_cross_section(outdir, perfil_id, progresiva_m,
                                s_pts_final, cloud["depth"], cloud["beam_index"],
                                s_grid, depth_grid,
-                               brazo=brazo, ws_elev=ws_elev, datum_name=datum_name)
+                               brazo=brazo, ws_elev=ws_elev, datum_name=datum_name,
+                               river=river)
     log.append(f"[ok ] {plot1.name}")
     log.append(f"[ok ] {plot2.name}")
 
@@ -3978,7 +4347,7 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None,
         ax_path = export_axis_shp(outdir, perfil_id, progresiva_m, axis_origin,
                                   theta_section_final,
                                   (float(s_grid[0]), float(s_grid[-1])), utm_crs,
-                                  brazo=brazo)
+                                  brazo=brazo, out_crs=posgar_crs)
         if ax_path: log.append(f"[ok ] {ax_path.name}")
         pp = export_profile_points_shp(outdir, perfil_id, progresiva_m, geo,
                                        utm_crs, posgar_crs, brazo=brazo, ws_elev=ws_elev)
@@ -4323,7 +4692,7 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
     p2 = plot_cross_section(outdir, gid, progresiva_m,
                             s_pts + s_shift, cloud["depth"], cloud["beam_index"],
                             s_grid, depth_grid, brazo=brazo, ws_elev=ws_elev,
-                            datum_name=datum_name)
+                            datum_name=datum_name, river=river)
     log.append(f"[ok ] {p2.name}")
     pqc = plot_group_qc(outdir, gid, s_grid, depth_grid, stack, sigma, group,
                         ws_elev=ws_elev, datum_name=datum_name, qstat=qstat)
@@ -4333,7 +4702,7 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         ax_path = export_axis_shp(outdir, gid, progresiva_m, axis_origin,
                                   theta_section_final,
                                   (float(s_grid[0]), float(s_grid[-1])), utm_crs,
-                                  brazo=brazo)
+                                  brazo=brazo, out_crs=posgar_crs)
         if ax_path: log.append(f"[ok ] {ax_path.name}")
         pp = export_profile_points_shp(outdir, gid, progresiva_m, geo,
                                        utm_crs, posgar_crs, brazo=brazo, ws_elev=ws_elev)
@@ -4472,66 +4841,316 @@ _BRAZO_PALETTE = ["tab:blue", "tab:red", "tab:green", "tab:purple",
                   "tab:orange", "tab:brown", "tab:pink", "tab:olive"]
 
 
+# 6.2: colours are assigned by POSITION in the sorted set of brazo labels of the
+# run, registered here before plotting. v6.1 used hash(), which Python salts per
+# process: the same brazo changed colour between runs (MI came out green, blue
+# and brown in three consecutive runs) and two labels could collide in one run.
+_BRAZO_ORDER: tuple = ()
+
+
+def set_brazo_order(labels):
+    """Register the brazo labels present in this run (deterministic colours)."""
+    global _BRAZO_ORDER
+    _BRAZO_ORDER = tuple(sorted({str(l) for l in labels if l}))
+    return _BRAZO_ORDER
+
+
 def _brazo_color(label):
-    """Stable colour for an arbitrary brazo label (MI / MD / M2 ... or ''). The
-    empty label (main channel, no island) is neutral grey."""
+    """Stable colour for a brazo label (MI / MD / M2 ... or ''). The empty label
+    (main channel, no island) is neutral grey."""
     if not label:
-        return "0.35"
-    return _BRAZO_PALETTE[(hash(label) % len(_BRAZO_PALETTE))]
+        return "0.30"
+    order = _BRAZO_ORDER or (str(label),)
+    try:
+        i = order.index(str(label))
+    except ValueError:
+        i = len(order)
+    return _BRAZO_PALETTE[i % len(_BRAZO_PALETTE)]
 
 
-def plot_survey_planview(results, network, resumen_dir: Path):
-    """Centerlines (per river) + every section axis, coloured by brazo, labelled
-    by the river's official km."""
-    fig, ax = plt.subplots(figsize=(11, 12))
-    # centerlines (network is in its own CRS = EPSG:5344, same as xp/yp)
+def _px_samples(ax, xs, ys, step_px=3.0):
+    """Sample a polyline in DISPLAY pixels, ~every step_px, as an obstacle set
+    for label placement."""
+    p = ax.transData.transform(np.column_stack([np.asarray(xs, dtype=float),
+                                                np.asarray(ys, dtype=float)]))
+    p = p[np.isfinite(p).all(axis=1)]
+    if len(p) < 2:
+        return p if len(p) else np.zeros((0, 2))
+    out = []
+    for i in range(len(p) - 1):
+        d = float(np.hypot(*(p[i + 1] - p[i])))
+        n = max(int(d / step_px), 1)
+        t = np.linspace(0, 1, n + 1)[:, None]
+        out.append(p[i] + t * (p[i + 1] - p[i]))
+    return np.vstack(out)
+
+
+def _place_labels(fig, ax, sections, obstacles, fontsize=7.2, pad=2.5):
+    """6.2: chainage labels placed so they touch nothing.
+
+    v6.1 wrote `format_progresiva(km).split("+")[0] + "k"` at the section
+    centroid: every transect in one kilometre got the SAME text ('62k' for
+    62+150, 62+480 and 62+905) and labels landed on top of the sections and the
+    centerline. Here each label carries its full chainage and is tried at both
+    ends of its section, at several outward offsets, until its measured text box
+    clears (a) the sampled geometry — centerlines, brazo axes, EVERY section,
+    the scale bar — (b) the boxes already placed and (c) the axes border.
+
+    A section with a neighbour closer than CROWD_PX starts from the far offsets
+    and always gets a thin leader line: in a cluster, proximity alone does not
+    say which label belongs to which section. Returns the number placed."""
+    if not sections:
+        return 0
+    rend = fig.canvas.get_renderer()
+    k = 72.0 / fig.dpi                     # pixels -> points, for offset points
+    CROWD_PX = 28.0
+    ends = np.array([ax.transData.transform((s[0][2], s[0][3])) for s in sections])
+    crowd = [bool(np.any(np.hypot(*(ends - e).T)[np.arange(len(ends)) != i] < CROWD_PX))
+             for i, e in enumerate(ends)]
+    near = ((7, 0), (7, 9), (7, -9), (14, 0), (14, 14), (14, -14),
+            (3, 13), (3, -13), (22, 16), (22, -16), (30, 20), (30, -20))
+    far = ((22, 16), (22, -16), (30, 20), (30, -20), (38, 26), (38, -26),
+           (14, 22), (14, -22), (46, 30), (46, -30))
+    ax_bb = ax.get_window_extent()
+    boxes, placed = [], 0
+    for ((xa, ya, xb, yb), text, col), is_crowded in zip(sections, crowd):
+        pa = ax.transData.transform((xa, ya))
+        pb = ax.transData.transform((xb, yb))
+        u = pb - pa
+        L = float(np.hypot(*u)) or 1.0
+        u = u / L
+        n = np.array([-u[1], u[0]])
+        done = False
+        for end_xy, sgn in (((xb, yb), 1.0), ((xa, ya), -1.0)):
+            for along, across in ((far + near) if is_crowded else near):
+                off = sgn * along * u + across * n
+                arrow = (dict(arrowstyle="-", lw=0.5, color="0.60",
+                              shrinkA=0, shrinkB=2.5)
+                         if (is_crowded or float(np.hypot(*off)) > 16.0) else None)
+                t = ax.annotate(text, end_xy, xytext=(off[0] * k, off[1] * k),
+                                textcoords="offset points", fontsize=fontsize,
+                                color="0.25", ha="left" if off[0] >= 0 else "right",
+                                va="bottom" if off[1] >= 0 else "top",
+                                zorder=5, arrowprops=arrow)
+                # Annotation.get_window_extent() unions text AND leader, and the
+                # leader touches its own section by construction -> measure the
+                # TEXT only, after the offset transform has been resolved.
+                t.update_positions(rend)
+                bb = MplText.get_window_extent(t, renderer=rend)
+                x0, y0 = bb.x0 - pad, bb.y0 - pad
+                x1, y1 = bb.x1 + pad, bb.y1 + pad
+                inside = (x0 > ax_bb.x0 and x1 < ax_bb.x1
+                          and y0 > ax_bb.y0 and y1 < ax_bb.y1)
+                hit_obs = bool(len(obstacles) and np.any(
+                    (obstacles[:, 0] > x0) & (obstacles[:, 0] < x1)
+                    & (obstacles[:, 1] > y0) & (obstacles[:, 1] < y1)))
+                hit_lbl = any(not (x1 < q[0] or x0 > q[2] or y1 < q[1] or y0 > q[3])
+                              for q in boxes)
+                if inside and not hit_obs and not hit_lbl:
+                    boxes.append((x0, y0, x1, y1))
+                    placed += 1
+                    done = True
+                    break
+                t.remove()
+            if done:
+                break
+        if not done:
+            ax.plot([xb], [yb], ".", color=col, ms=3.2, zorder=5)
+    return placed
+
+
+def _crs_axis_labels(crs):
+    """('Este <crs> [m]', 'Norte <crs> [m]') for the run's output CRS (6.2:
+    v6.1 hard-coded 'POSGAR07 f2' whatever it actually wrote)."""
+    try:
+        c = CRS.from_user_input(crs)
+        name = c.name
+        epsg = c.to_epsg()
+        tag = f"{name} — EPSG:{epsg}" if epsg else name
+    except Exception:
+        tag = "CRS de salida"
+    return f"Este {tag} [m]", f"Norte {tag} [m]"
+
+
+def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None):
+    """Centerlines + every section axis, coloured by brazo, labelled by the
+    river's official chainage.
+
+    6.2: the view window is computed FIRST and only the geometry that falls
+    inside it is drawn, so the legend can no longer list a river or a brazo that
+    is not in the picture (v6.1 iterated every axis and every anabranch, with no
+    de-duplication of the brazo labels at all). Figure size follows the data
+    aspect; labels are placed by _place_labels."""
+    rs = sorted(results, key=_sort_key)
+    all_x = np.concatenate([r["xp"] for r in rs]) if rs else np.array([0.0])
+    all_y = np.concatenate([r["yp"] for r in rs]) if rs else np.array([0.0])
+    pad = 0.10 * max(float(np.ptp(all_x)), float(np.ptp(all_y)), 100.0)
+    x0, x1 = float(all_x.min()) - pad, float(all_x.max()) + pad
+    y0, y1 = float(all_y.min()) - pad, float(all_y.max()) + pad
+
+    # Figure sized from the data aspect, then the WINDOW is expanded to match
+    # the box exactly: with set_aspect('equal') any mismatch would be drawn as
+    # white bands inside the axes (a 50 km reach of 140 m sections is extreme).
+    W_IN, L, R, T, B = 11.0, 1.15, 0.30, 1.15, 1.50
+    axw = W_IN - L - R
+    axh = float(np.clip(axw * (y1 - y0) / max(x1 - x0, 1e-9), 2.2, 9.0))
+    want = axh / axw                                  # box height / width
+    dx, dy = x1 - x0, y1 - y0
+    if dy / dx < want:                                # too flat -> grow y
+        g = (want * dx - dy) / 2.0
+        y0, y1 = y0 - g, y1 + g
+    else:                                             # too tall -> grow x
+        g = (dy / want - dx) / 2.0
+        x0, x1 = x0 - g, x1 + g
+    H_IN = axh + T + B
+    fig = plt.figure(figsize=(W_IN, H_IN))
+    ax = fig.add_axes([L / W_IN, B / H_IN, axw / W_IN, axh / H_IN])
+
+    def _clip(g):
+        """Part of a centerline inside the view (+ one vertex), or None."""
+        xs, ys = np.asarray(g.xy[0]), np.asarray(g.xy[1])
+        m = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+        if not m.any():
+            return None
+        i0 = max(int(np.argmax(m)) - 1, 0)
+        i1 = min(len(xs) - int(np.argmax(m[::-1])) + 1, len(xs))
+        return xs[i0:i1], ys[i0:i1]
+
+    drawn, seen = [], set()
     if network is not None:
-        seenr = set()
         for axr in network.axes:
-            xs, ys = axr.main.xy
-            lbl = f"Eje {axr.river} (cauce principal)"
-            ax.plot(xs, ys, "-", color="0.6", lw=1.4,
-                    label=lbl if lbl not in seenr else None)
-            seenr.add(lbl)
+            seg = _clip(axr.main)
+            if seg is not None:
+                lbl = f"Eje {axr.river} (cauce principal)"
+                ax.plot(*seg, "-", color="0.62", lw=1.6, zorder=1,
+                        label=lbl if lbl not in seen else None)
+                seen.add(lbl)
+                drawn.append(seg)
             for b in axr.anabranches:
-                bx, by = b["geom"].xy
-                ax.plot(bx, by, color=_brazo_color(b.get("label")),
-                        lw=1.4, ls="--",
-                        label=f"{axr.river} {b.get('label') or 'brazo'} (eje)")
-    seen = set()
-    for r in sorted(results, key=_sort_key):
+                seg = _clip(b["geom"])
+                if seg is None:
+                    continue
+                lab = b.get("label") or "brazo"
+                lbl = f"Eje brazo {axr.river} {lab}"
+                ax.plot(*seg, ls="--", lw=1.4, color=_brazo_color(b.get("label")),
+                        zorder=1, label=lbl if lbl not in seen else None)
+                seen.add(lbl)
+                drawn.append(seg)
+
+    sections = []
+    for r in rs:
         xp, yp = r["xp"], r["yp"]
         col = _brazo_color(r["brazo"])
-        lbl = f"Secciones ({r.get('river','')}{' '+r['brazo'] if r['brazo'] else ''})"
-        ax.plot([xp[0], xp[-1]], [yp[0], yp[-1]], "-", color=col, lw=2.2,
+        lbl = "Secciones" + (f" — brazo {r['brazo']}" if r["brazo"] else "")
+        ax.plot([xp[0], xp[-1]], [yp[0], yp[-1]], "-", color=col, lw=2.4,
+                zorder=3, solid_capstyle="round",
                 label=lbl if lbl not in seen else None)
         seen.add(lbl)
-        mx, my = 0.5 * (xp[0] + xp[-1]), 0.5 * (yp[0] + yp[-1])
+        drawn.append(([xp[0], xp[-1]], [yp[0], yp[-1]]))
         kmo = r.get("km_oficial")
         if kmo is not None:
-            ax.annotate(format_progresiva(kmo).split("+")[0] + "k",
-                        (mx, my), fontsize=7, color=col,
-                        xytext=(3, 3), textcoords="offset points")
+            sections.append(((float(xp[0]), float(yp[0]),
+                              float(xp[-1]), float(yp[-1])),
+                             format_progresiva(kmo).split(".")[0], col))
 
-    # Zoom to the surveyed reach (the full centerline is still drawn for context
-    # but would make 40-m sections invisible on a multi-km river).
-    all_x = np.concatenate([r["xp"] for r in results])
-    all_y = np.concatenate([r["yp"] for r in results])
-    if all_x.size:
-        pad = 0.12 * max(float(np.ptp(all_x)), float(np.ptp(all_y)), 100.0)
-        ax.set_xlim(all_x.min() - pad, all_x.max() + pad)
-        ax.set_ylim(all_y.min() - pad, all_y.max() + pad)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
     ax.set_aspect("equal")
-    ax.set_xlabel("Este POSGAR07 f2 [m]")
-    ax.set_ylabel("Norte POSGAR07 f2 [m]")
-    ax.set_title("Vista en planta del relevamiento — ejes de secciones por progresiva y brazo")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
+    ax.ticklabel_format(style="plain", useOffset=False)
+    milesep = FuncFormatter(lambda v, _p: f"{v:,.0f}".replace(",", "."))
+    ax.xaxis.set_major_formatter(milesep)
+    ax.yaxis.set_major_formatter(milesep)
+    xlab, ylab = _crs_axis_labels(out_crs if out_crs is not None
+                                  else getattr(network, "crs", None))
+    ax.set_xlabel(xlab)
+    ax.set_ylabel(ylab)
+    ax.grid(True, alpha=0.2, lw=0.6)
+    ax.set_axisbelow(True)
+
+    # scale bar + north, BEFORE the labels so they count as obstacles
+    L_bar = 10 ** math.floor(math.log10(max((x1 - x0) / 4.0, 1.0)))
+    for mult in (5, 2, 1):
+        if mult * L_bar <= (x1 - x0) / 3.5:
+            L_bar = mult * L_bar
+            break
+    bx = x0 + 0.03 * (x1 - x0)
+    by = y0 + 0.055 * (y1 - y0)
+    ax.plot([bx, bx + L_bar], [by, by], "-", color="0.15", lw=2.6,
+            solid_capstyle="butt", zorder=6)
+    ax.text(bx + L_bar / 2, by, f"{L_bar / 1000:g} km" if L_bar >= 1000
+            else f"{L_bar:g} m", ha="center", va="bottom", fontsize=8,
+            color="0.15", zorder=6)
+    ax.annotate("N", xy=(0.028, 0.94), xytext=(0.028, 0.80),
+                xycoords="axes fraction", textcoords="axes fraction",
+                ha="center", va="center", fontsize=10, color="0.15",
+                arrowprops=dict(arrowstyle="-|>", color="0.15", lw=1.4))
+
+    rivers = [k for k in dict.fromkeys(r.get("river", "") for r in rs) if k]
+    kms = [r["km_oficial"] for r in rs if r.get("km_oficial") is not None]
+    fig.text(L / W_IN, 1 - 0.30 / H_IN, "Vista en planta del relevamiento",
+             fontsize=12.5, fontweight="semibold", ha="left", va="top")
+    sub_bits = [f"{len(rs)} secciones"]
+    if rivers:
+        sub_bits.append("Río " + " / ".join(rivers))
+    if kms:
+        sub_bits.append(f"progresivas {format_progresiva(min(kms))} a "
+                        f"{format_progresiva(max(kms))}")
+    fig.text(L / W_IN, 1 - 0.60 / H_IN, "   ·   ".join(sub_bits),
+             fontsize=8.8, color="0.35", ha="left", va="top")
+    # legend a fixed 0.62 in below the axes, whatever the box height is
+    _legend_unique(ax, loc="upper center", bbox_to_anchor=(0.5, -0.62 / axh),
+                   ncol=4, fontsize=8.5, frameon=False, columnspacing=2.0)
+
+    fig.canvas.draw()
+    obs = [_px_samples(ax, xs, ys) for xs, ys in drawn]
+    obs.append(_px_samples(ax, [bx, bx + L_bar], [by, by]))
+    obs = [o for o in obs if len(o)]
+    _place_labels(fig, ax, sections,
+                  np.vstack(obs) if obs else np.zeros((0, 2)))
+
     path = resumen_dir / "survey_plan_view.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
+
+
+def _bed_line(ax, p_m, z, color="#7a5230", lw=1.3, label=None):
+    """6.2: continuous bed line through the thalwegs of consecutive sections.
+
+    PCHIP (monotone piecewise cubic), NOT a natural spline: it never overshoots
+    between the points, so the drawn bed can never dip below a measured thalweg
+    — which matters on a figure somebody reads elevations off. The line is cut
+    where the gap between sections exceeds max(3x the median spacing, 2 km);
+    the caller draws one line per (path, brazo), so MI and MD are never joined.
+    Falls back to a straight polyline with fewer than 3 points."""
+    p = np.asarray(p_m, dtype=float)
+    z = np.asarray(z, dtype=float)
+    ok = np.isfinite(p) & np.isfinite(z)
+    p, z = p[ok], z[ok]
+    if p.size < 2:
+        return
+    o = np.argsort(p)
+    p, z = p[o], z[o]
+    p, idx = np.unique(p, return_index=True)
+    z = z[idx]
+    d = np.diff(p)
+    cuts = np.where(d > max(3.0 * float(np.median(d)), 2000.0))[0] if d.size else []
+    first = True
+    for chunk in np.split(np.arange(p.size), np.asarray(cuts, dtype=int) + 1):
+        if chunk.size < 2:
+            continue
+        xc, zc = p[chunk], z[chunk]
+        if chunk.size >= 3:
+            try:
+                from scipy.interpolate import PchipInterpolator
+                f = PchipInterpolator(xc, zc)
+                xf = np.linspace(xc[0], xc[-1], max(200, 8 * chunk.size))
+                xc, zc = xf, f(xf)
+            except Exception:
+                pass
+        ax.plot(xc / 1000.0, zc, "-", color=color, lw=lw, alpha=0.9, zorder=3,
+                solid_capstyle="round", label=label if first else None)
+        first = False
 
 
 def _legend_unique(ax, **kw):
@@ -4621,14 +5240,23 @@ def plot_long_profile(results, wsp, resumen_dir: Path, datum_name: str, network=
             for p, r in on:
                 if r["ws_elev"] is not None:
                     ax.plot([p / 1000.0] * 2, [r["thalweg_elev"], r["ws_elev"]], "-",
-                            color="0.7", lw=0.8, zorder=1)
+                            color="0.75", lw=0.6, alpha=0.6, zorder=1)
             thal = [r["thalweg_elev"] if r["ws_elev"] is not None else np.nan
                     for _p, r in on]
             wss = [r["ws_elev"] if r["ws_elev"] is not None else np.nan for _p, r in on]
-            ax.plot(xs, thal, "o", color="#7a5230", ms=6,
-                    label="Thalweg (cota mínima del lecho)", zorder=3)
-            ax.plot(xs, wss, "_", color="navy", ms=10, mew=2,
-                    label="Pelo de agua en cada sección", zorder=3)
+            # 6.2: one continuous bed line per brazo (MI and MD are different
+            # channels and must not be joined across an island)
+            for br in dict.fromkeys(r["brazo"] for _p, r in on):
+                sel = [(p, r) for p, r in on if r["brazo"] == br]
+                _bed_line(ax, [p for p, _r in sel],
+                          [r["thalweg_elev"] if r["ws_elev"] is not None else np.nan
+                           for _p, r in sel],
+                          color=_brazo_color(br) if br else "#7a5230",
+                          label="Lecho (PCHIP entre secciones)" if not br else None)
+            ax.plot(xs, thal, "o", color="#7a5230", ms=3.8,
+                    label="Thalweg (cota mínima del lecho)", zorder=4)
+            ax.plot(xs, wss, "_", color="navy", ms=8, mew=1.6,
+                    label="Pelo de agua en cada sección", zorder=4)
             n_rel = sum(1 for _p, r in on if r["ws_elev"] is None)
             if n_rel:
                 ax.text(0.01, 0.02, f"{n_rel} sección(es) sin pelo de agua (cotas "
@@ -4637,16 +5265,22 @@ def plot_long_profile(results, wsp, resumen_dir: Path, datum_name: str, network=
             ax.set_ylabel(f"Cota {datum_name} [m]")
         else:
             thal = [-r["max_depth"] for _p, r in on]
-            ax.plot(xs, thal, "o-", color="#7a5230", ms=6,
-                    label="Thalweg (profundidad máx., relativa)")
+            _bed_line(ax, [p for p, _r in on], thal,
+                      label="Lecho (PCHIP entre secciones)")
+            ax.plot(xs, thal, "o", color="#7a5230", ms=3.8,
+                    label="Thalweg (profundidad máx., relativa)", zorder=4)
             ax.axhline(0, color="navy", lw=1, ls="--", alpha=0.7,
                        label="Pelo de agua (rel.)")
             ax.set_ylabel("Cota relativa al pelo de agua [m]")
+        # 6.2: label only the FIRST section of each run of the same brazo —
+        # v6.1 stacked one label per section at the same y
+        prev = None
         for (p, r), th in zip(on, thal):
-            if r["brazo"]:
-                ax.annotate(r["brazo"], (p / 1000.0, thal_min(thal)), fontsize=7,
+            if r["brazo"] and r["brazo"] != prev and np.isfinite(th):
+                ax.annotate(r["brazo"], (p / 1000.0, th), fontsize=7.5,
                             color=_brazo_color(r["brazo"]), ha="center", va="top",
-                            xytext=(0, -2), textcoords="offset points")
+                            xytext=(0, -6), textcoords="offset points", zorder=5)
+            prev = r["brazo"]
         ax.set_xlim(x0 / 1000.0, x1 / 1000.0)
         ax.set_xlabel(f"Progresiva continua del recorrido {nombre} [km]")
         ax.set_title(f"Perfil longitudinal — recorrido {nombre}: pelo de agua y thalweg")
@@ -4681,15 +5315,17 @@ def _plot_long_profile_simple(results, wsp, resumen_dir: Path, datum_name: str):
             if r["ws_elev"] is not None:
                 ax.plot([_prof_x(r), _prof_x(r)], [r["thalweg_elev"], r["ws_elev"]],
                         "-", color="0.7", lw=0.8, zorder=1)
-        ax.plot(prog, thal, "o", color="#7a5230", ms=6,
-                label="Thalweg (cota mínima del lecho)", zorder=3)
-        ax.plot(prog, wss, "_", color="navy", ms=10, mew=2,
-                label="Pelo de agua en cada sección", zorder=2)
+        _bed_line(ax, prog, thal, label="Lecho (PCHIP entre secciones)")
+        ax.plot(prog, thal, "o", color="#7a5230", ms=3.8,
+                label="Thalweg (cota mínima del lecho)", zorder=4)
+        ax.plot(prog, wss, "_", color="navy", ms=8, mew=1.6,
+                label="Pelo de agua en cada sección", zorder=4)
         ax.set_ylabel(f"Cota {datum_name} [m]")
     else:
         thal = [-r["max_depth"] for r in rs]
-        ax.plot(prog, thal, "o-", color="#7a5230", ms=6,
-                label="Thalweg (profundidad máx., relativa)")
+        _bed_line(ax, prog, thal, label="Lecho (PCHIP entre secciones)")
+        ax.plot(prog, thal, "o", color="#7a5230", ms=3.8,
+                label="Thalweg (profundidad máx., relativa)", zorder=4)
         ax.axhline(0, color="navy", lw=1, ls="--", alpha=0.7, label="Pelo de agua (rel.)")
         ax.set_ylabel("Cota relativa al pelo de agua [m]")
     for r in rs:
@@ -4713,11 +5349,16 @@ def thal_min(vals):
     return min(v) if v else 0.0
 
 
-def export_survey_shapefiles(results, resumen_dir: Path, datum_name: str):
-    """Combined survey_axes.shp + survey_profile_points.shp in EPSG:5344."""
+def export_survey_shapefiles(results, resumen_dir: Path, datum_name: str,
+                             out_crs: CRS | None = None):
+    """Combined survey_axes.shp + survey_profile_points.shp.
+
+    6.2: in the run's output CRS, which is also the CRS the per-transect
+    geometry was written in — so the layers overlay without reprojection."""
     if not HAS_GPD:
         return None, None
-    crs5344 = CRS.from_epsg(5344)
+    crs5344 = CRS.from_user_input(out_crs) if out_crs is not None \
+        else CRS.from_epsg(5344)
     rs = sorted(results, key=_sort_key)
 
     def _kmo(r):
@@ -4764,9 +5405,9 @@ def export_survey_shapefiles(results, resumen_dir: Path, datum_name: str):
 CLOUD_SHP_MAX = 1_500_000
 
 
-def export_survey_beam_cloud(results, resumen_dir: Path):
+def export_survey_beam_cloud(results, resumen_dir: Path, out_crs: CRS | None = None):
     """Merged point cloud of EVERY bed return of EVERY transect, as PointZ in
-    EPSG:5344 with Z = bed_elev (SRVN16). Written as a shapefile, falling back to
+    the run's output CRS with Z = bed_elev (SRVN16). Written as a shapefile, falling back to
     GeoPackage past the shapefile limits. Attributes (km deliberately excluded):
         pt_id, transect, ens, beam_id, beam_type (slant|vert),
         bed_elev, depth, river, ws_elev, flag
@@ -4775,7 +5416,8 @@ def export_survey_beam_cloud(results, resumen_dir: Path):
     (no WS)."""
     if not HAS_GPD:
         return None
-    crs5344 = CRS.from_epsg(5344)
+    crs5344 = CRS.from_user_input(out_crs) if out_crs is not None \
+        else CRS.from_epsg(5344)
     rs = sorted(results, key=_sort_key)
 
     n_total = int(sum(len(r.get("cloud_z", [])) for r in rs))
@@ -4811,7 +5453,7 @@ def export_survey_beam_cloud(results, resumen_dir: Path):
             transect[k] = r["perfil"]
             ens[k] = int(ce[i])
             b = int(bidx[i])
-            beam_id[k] = "VB" if b == 0 else str(b)
+            beam_id[k] = "VB" if b == 0 else f"B{b}"
             beam_type[k] = "vert" if b == 0 else "slant"
             bed_elev[k] = float(z[i])
             depth[k] = float(dep[i])
@@ -4844,6 +5486,485 @@ def export_survey_beam_cloud(results, resumen_dir: Path):
 # ============================================================================ #
 #  MAIN
 # ============================================================================ #
+
+# ============================================================================ #
+#  6.2 — BEAM CLOUD OF THE NON-TRANSECT .mat FILES ("recorridos")
+# ============================================================================ #
+#
+# A campaign holds more than cross-sections: longitudinal runs between sections,
+# approaches, repositioning, static measurements. They carry valid bottom
+# detections and GNSS and were simply discarded. Here every beam footprint of
+# those files becomes ONE categorised point cloud (shapefile + CSV) with, per
+# point: which beam produced it, the river, the official chainage, the signed
+# offset from the axis and its OWN water surface — a 2 km run crosses ~2 m of
+# head, so one stage per file would be wrong by metres.
+#
+# They deliberately do NOT enter survey_index.csv, the aforo grouping, the
+# longitudinal profile or the path ranking: this is a parallel output, meant to
+# feed interpolation between sections and the channel DTM.
+
+TRACK_MIN_SPAN = 30.0        # [m] shorter end-to-end -> 'estatico'
+
+
+def classify_track(dkm, dofs, endspan, override=None):
+    """Label a .mat as longitudinal / aproximacion / estatico / otro (6.2).
+
+    The discriminant is the CHAINAGE span (`dkm`) the track covers against the
+    CROSS-CHANNEL span (`dofs`, the spread of the signed offsets from the axis):
+    a cross-section advances no chainage and spans the channel, a longitudinal
+    run does the opposite. `endspan` is the end-to-end distance of the track.
+    An INI [recorridos] entry wins over the geometry. Returns (class, source)."""
+    if override:
+        return override, "INI [recorridos]"
+    if not np.isfinite(endspan) or endspan < TRACK_MIN_SPAN:
+        return "estatico", "geometría"
+    if not np.isfinite(dkm):
+        return "otro", "geometría"
+    dofs = float(dofs) if np.isfinite(dofs) else 0.0
+    if dkm > max(50.0, 2.0 * dofs):
+        return "longitudinal", "geometría"
+    if dkm > TRACK_MIN_SPAN or dofs > TRACK_MIN_SPAN:
+        return "aproximacion", "geometría"
+    return "otro", "geometría"
+
+
+def _thin_grid(x, y, cell):
+    """Boolean mask keeping one point per `cell`-sized square (6.2)."""
+    if not cell or cell <= 0:
+        return np.ones(len(x), dtype=bool)
+    key = (np.floor(np.asarray(x) / cell).astype(np.int64) << 32) \
+        ^ np.floor(np.asarray(y) / cell).astype(np.int64)
+    _u, first = np.unique(key, return_index=True)
+    m = np.zeros(len(x), dtype=bool)
+    m[first] = True
+    return m
+
+
+def process_track(matpath: Path, args, network=None, wsm=None, out_crs=None,
+                  override=None, log: list | None = None):
+    """Beam cloud of ONE non-transect .mat, located and levelled point by point.
+
+    Returns a dict with parallel arrays (one entry per beam footprint) plus the
+    per-file summary written to tracks_index.csv, or None if unusable."""
+    log = log if log is not None else []
+    stem = Path(matpath).stem
+    try:
+        mat = load_mat(matpath)
+        data = extract_data(mat)
+    except Exception as e:
+        log.append(f"[warn] recorrido {stem}: no se pudo leer ({e})")
+        return None
+
+    n_ens = int(len(data["vb_depth"]))
+    n_nofix = int(data.get("n_nofix", 0))
+    if not np.any(np.isfinite(data["lat"])):
+        log.append(f"[warn] recorrido {stem}: sin posición GNSS válida — omitido")
+        return None
+
+    utm_crs = auto_utm_crs(data["lat"], data["lon"])
+    out_crs = out_crs if out_crs is not None else CRS.from_epsg(5344)
+    utm = None
+    if data["utm"] is not None and np.ndim(data["utm"]) == 2 \
+            and np.isfinite(data["utm"]).any():
+        utm = np.array(data["utm"], dtype=float)
+        miss = ~np.isfinite(utm).all(axis=1)
+        fill = miss & np.isfinite(data["lat"]) & np.isfinite(data["lon"])
+        if fill.any():
+            tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
+            ex, ny = tr.transform(data["lon"][fill], data["lat"][fill])
+            utm[fill] = np.column_stack([ex, ny])
+    if utm is None:
+        tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
+        ex, ny = tr.transform(data["lon"], data["lat"])
+        utm = np.column_stack([ex, ny])
+
+    # --- spike detection: MARKED, not dropped. For a DTM it matters which
+    # returns were rejected and why, so the filter becomes a `spike` column.
+    vb_ok = np.ones(n_ens, dtype=bool)
+    bt_ok = np.ones((n_ens, 4), dtype=bool)
+    if args.depth_filter != "off":
+        vb_ok = filter_depth_spikes(np.asarray(data["vb_depth"], dtype=float))
+        bt = np.asarray(data["bt_beams"], dtype=float)
+        for k in range(min(4, bt.shape[1] if bt.ndim == 2 else 0)):
+            bt_ok[:, k] = filter_depth_spikes(bt[:, k])
+
+    keep = np.ones(n_ens, dtype=bool)
+    dec = max(1, int(getattr(args, "tracks_decimate", 1)))
+    if dec > 1:
+        keep[:] = False
+        keep[::dec] = True
+    dat = dict(data)
+    if dec > 1:
+        dat["vb_depth"] = np.where(keep, data["vb_depth"], np.nan)
+        bt = np.asarray(data["bt_beams"], dtype=float).copy()
+        bt[~keep, :] = np.nan
+        dat["bt_beams"] = bt
+
+    cloud = build_beam_cloud(dat, utm, depth_ref="vb", bt_geometry="footprints",
+                             bt_avg=args.bt_avg, density_weighting=False)
+    if len(cloud["E"]) == 0:
+        log.append(f"[warn] recorrido {stem}: sin retornos de fondo — omitido")
+        return None
+
+    want = str(getattr(args, "tracks_beams", "all")).lower()
+    bidx = np.asarray(cloud["beam_index"], dtype=int)
+    sel = (bidx == 0) if want == "vb" else (bidx > 0) if want == "slant" \
+        else np.ones(len(bidx), dtype=bool)
+    for k in ("E", "N", "depth", "beam_index", "beam_freq_khz", "ens", "src"):
+        cloud[k] = np.asarray(cloud[k])[sel]
+    bidx = np.asarray(cloud["beam_index"], dtype=int)
+    ce = np.asarray(cloud["ens"], dtype=int)
+
+    # --- locate every ensemble on the network -----------------------------
+    nan = float("nan")
+    river = np.array([""] * n_ens, dtype=object)
+    brazo = np.array([""] * n_ens, dtype=object)
+    kmof = np.full(n_ens, nan)
+    dist = np.full(n_ens, nan)
+    offax = np.full(n_ens, nan)
+    kmint = np.full(n_ens, nan)
+    eflag = np.array([""] * n_ens, dtype=object)
+    tux = np.full(n_ens, nan)      # unit tangent of the axis at each ensemble,
+    tuy = np.full(n_ens, nan)      # in network CRS: used to carry km/offset
+    bx = np.full(n_ens, nan)       # from the boat to each beam FOOTPRINT
+    by = np.full(n_ens, nan)
+    forced = (override[1] if override else None)
+    tol = float(getattr(args, "tracks_locate_tol", 250.0))
+    if network is not None:
+        tr_n = Transformer.from_crs(utm_crs, network.crs, always_xy=True)
+        nx, ny = tr_n.transform(utm[:, 0], utm[:, 1])
+        for i in range(n_ens):
+            if not (np.isfinite(nx[i]) and np.isfinite(ny[i])):
+                continue
+            if forced:
+                loc = network.locate_on(forced, float(nx[i]), float(ny[i]))
+                cands = [loc] if loc else []
+            else:
+                cands = network.locate_all(float(nx[i]), float(ny[i]))
+            if not cands:
+                continue
+            c = cands[0]
+            if c["dist"] > tol:
+                eflag[i] = "OFF_AXIS"
+                dist[i] = c["dist"]
+                continue
+            # A track has no flow-perpendicular section, so the crossing rule of
+            # 6.1 cannot apply: near a confluence the nearest axis is all there
+            # is. Flag the doubt instead of hiding it.
+            if len(cands) > 1 and cands[1]["dist"] - c["dist"] < WS_AMBIG_MARGIN:
+                eflag[i] = "AMBIGUOUS"
+            river[i] = c["river"]; brazo[i] = c["brazo"]
+            kmint[i] = c["km_internal"]; kmof[i] = c["km_oficial"]
+            dist[i] = c["dist"]
+            ax_r = network._by_river.get(c["river"])
+            if ax_r is not None:                      # signed offset, + = left bank
+                s = float(c["km_internal"])
+                a = ax_r.main.interpolate(max(s - 5.0, 0.0))
+                b = ax_r.main.interpolate(min(s + 5.0, ax_r.main.length))
+                q = ax_r.main.interpolate(s)
+                tx, ty = b.x - a.x, b.y - a.y
+                Lt = math.hypot(tx, ty) or 1.0
+                tux[i], tuy[i] = tx / Lt, ty / Lt
+                bx[i], by[i] = float(nx[i]), float(ny[i])
+                vx, vy = float(nx[i]) - q.x, float(ny[i]) - q.y
+                offax[i] = (tx * vy - ty * vx) / Lt
+
+    # --- water surface, point by point, per river -------------------------
+    ws = np.full(n_ens, nan)
+    wsrc = np.array(["none"] * n_ens, dtype=object)
+    when = representative_time(data, mode=getattr(args, "time_epoch", "auto"),
+                               hint=_stem_timestamp(matpath))
+    if wsm is not None:
+        for rv in {r for r in river if r}:
+            m = np.array([r == rv for r in river])
+            e, sc, _nt = wsm.resolve_series(rv, kmint[m], when=when)
+            ws[m] = e
+            wsrc[m] = np.where(np.isfinite(e), sc, "none")
+
+    # --- chainage and signed offset PER FOOTPRINT, not per ensemble --------
+    # A slant beam lands r = depth*tan(25 deg) from the boat — up to ~2 m at
+    # 4.5 m of water. Carrying the ensemble's km/offset to its four footprints
+    # would smear the cloud by that much, which is the scale the cloud is meant
+    # to be gridded at. First-order transfer along the local axis frame.
+    km_pt = np.asarray(kmof[ce], dtype=float)
+    off_pt = np.asarray(offax[ce], dtype=float)
+    if network is not None:
+        tr_cn = Transformer.from_crs(utm_crs, network.crs, always_xy=True)
+        cxn, cyn = tr_cn.transform(cloud["E"], cloud["N"])
+        dX = np.asarray(cxn) - bx[ce]
+        dY = np.asarray(cyn) - by[ce]
+        km_pt = km_pt + (tux[ce] * dX + tuy[ce] * dY)
+        off_pt = off_pt + (tux[ce] * dY - tuy[ce] * dX)
+    dist_pt = np.where(np.isfinite(off_pt), np.abs(off_pt),
+                       np.asarray(dist[ce], dtype=float))
+
+    depth = np.asarray(cloud["depth"], dtype=float)
+    ws_pt = ws[ce]
+    rel = ~np.isfinite(ws_pt)
+    z = np.where(rel, -depth, ws_pt - depth)
+
+    spike = np.zeros(len(bidx), dtype=np.int8)
+    spike[bidx == 0] = (~vb_ok[ce[bidx == 0]]).astype(np.int8)
+    for k in range(1, 5):
+        m = bidx == k
+        if m.any():
+            spike[m] = (~bt_ok[ce[m], k - 1]).astype(np.int8)
+
+    flag = np.array([f for f in eflag[ce]], dtype=object)
+    flag = np.where(rel, np.where(flag == "", "REL",
+                                  np.char.add(flag.astype(str), ";REL")), flag)
+
+    tr_o = Transformer.from_crs(utm_crs, out_crs, always_xy=True)
+    X, Y = tr_o.transform(cloud["E"], cloud["N"])
+    X = np.asarray(X); Y = np.asarray(Y)
+
+    thin = float(getattr(args, "tracks_thin", 0.0) or 0.0)
+    if thin > 0:
+        keepm = _thin_grid(X, Y, thin)
+        X, Y, z, depth, bidx, ce, spike, flag, km_pt, off_pt, dist_pt = (
+            v[keepm] for v in (X, Y, z, depth, bidx, ce, spike, flag,
+                               km_pt, off_pt, dist_pt))
+        ws_pt = ws_pt[keepm]
+        cloud["beam_freq_khz"] = np.asarray(cloud["beam_freq_khz"])[keepm]
+        cloud["src"] = np.asarray(cloud["src"])[keepm]
+
+    t0 = sontek_time(data, mode=getattr(args, "time_epoch", "auto"),
+                     hint=_stem_timestamp(matpath))
+    tt = np.asarray(data["time"], dtype=float)
+    secs = tt - float(np.nanmin(tt)) if np.any(np.isfinite(tt)) else np.zeros(n_ens)
+    t_pt = np.array(["" if t0 is None or not np.isfinite(secs[i]) else
+                     (t0 + datetime.timedelta(seconds=float(secs[i]))).isoformat(
+                         timespec="seconds") for i in ce], dtype=object)
+
+    endspan = float(math.hypot(
+        np.nanmax(utm[:, 0]) - np.nanmin(utm[:, 0]),
+        np.nanmax(utm[:, 1]) - np.nanmin(utm[:, 1]))) if np.isfinite(utm).any() else nan
+    kmv = kmof[np.isfinite(kmof)]
+    dkm = float(np.ptp(kmv)) if kmv.size > 1 else 0.0
+    ofv = offax[np.isfinite(offax)]
+    dofs = float(np.ptp(ofv)) if ofv.size > 1 else 0.0
+    clase, clase_src = classify_track(dkm, dofs, endspan,
+                                      override[0] if override else None)
+    rivers = [r for r in dict.fromkeys(river) if r]
+    tally = {}
+    for v in wsrc[np.isfinite(ws)]:
+        tally[v] = tally.get(v, 0) + 1
+    warn = []
+    if n_nofix:
+        warn.append(f"{n_nofix} ensambles sin fix GNSS")
+    n_off = int(np.count_nonzero([f == "OFF_AXIS" for f in eflag]))
+    if n_off:
+        warn.append(f"{n_off} ensambles a más de {tol:.0f} m de todo eje")
+    n_amb = int(np.count_nonzero([f == "AMBIGUOUS" for f in eflag]))
+    if n_amb:
+        warn.append(f"{n_amb} ensambles con dos ríos candidatos")
+    if np.any(~np.isfinite(ws_pt)):
+        warn.append(f"{int(np.count_nonzero(~np.isfinite(ws_pt)))} puntos sin "
+                    "pelo de agua (cota relativa)")
+
+    log.append(f"[info] recorrido {stem}: {clase} ({clase_src}), {n_ens} ensambles, "
+               f"{len(X)} puntos, "
+               + (f"{'/'.join(rivers)} km {format_progresiva(np.nanmin(kmv))}–"
+                  f"{format_progresiva(np.nanmax(kmv))}" if kmv.size else "sin río")
+               + (f"   [warn] {'; '.join(warn)}" if warn else ""))
+
+    return dict(
+        file=stem, path=Path(matpath), clase=clase, clase_src=clase_src,
+        n_ens=n_ens, n_nofix=n_nofix, n_pts=int(len(X)),
+        rivers=rivers, km_min=float(np.nanmin(kmv)) if kmv.size else nan,
+        km_max=float(np.nanmax(kmv)) if kmv.size else nan,
+        t_start=t0, dur_min=(float(np.nanmax(secs) - np.nanmin(secs)) / 60.0
+                             if np.any(np.isfinite(secs)) else nan),
+        ws_tally=tally, warn=warn, endspan=endspan,
+        X=X, Y=Y, Z=np.asarray(z, dtype=float), depth=depth,
+        beam_index=bidx, ens=ce, spike=spike, flag=flag,
+        freq=np.asarray(cloud["beam_freq_khz"], dtype=float),
+        src=np.asarray(cloud["src"], dtype=int),
+        ws=np.asarray(ws_pt, dtype=float),
+        ws_src=np.asarray([wsrc[i] for i in ce], dtype=object),
+        river=np.asarray([river[i] for i in ce], dtype=object),
+        brazo=np.asarray([brazo[i] for i in ce], dtype=object),
+        km_ofic=np.asarray(km_pt, dtype=float),
+        off_axis=np.asarray(off_pt, dtype=float),
+        dist_axis=np.asarray(dist_pt, dtype=float),
+        t_utc=t_pt,
+    )
+
+
+TRACK_FIELDS = [
+    ("pt_id", "i"), ("file", "s"), ("class", "s"), ("ens", "i"),
+    ("beam_id", "s"), ("beam_type", "s"), ("src", "s"), ("freq_khz", "i"),
+    ("depth", "f"), ("ws_elev", "f"), ("ws_src", "s"), ("bed_elev", "f"),
+    ("river", "s"), ("brazo", "s"), ("km_ofic", "f"), ("off_axis", "f"),
+    ("dist_axis", "f"), ("t_utc", "s"), ("spike", "i"), ("flag", "s"),
+]
+
+
+def _track_columns(tracks):
+    """Assemble the export table from the per-file arrays (6.2)."""
+    cols = {k: [] for k, _t in TRACK_FIELDS}
+    X, Y = [], []
+    pid = 0
+    for t in tracks:
+        n = len(t["X"])
+        b = t["beam_index"]
+        cols["pt_id"] += list(range(pid, pid + n)); pid += n
+        cols["file"] += [t["file"]] * n
+        cols["class"] += [t["clase"]] * n
+        cols["ens"] += [int(v) for v in t["ens"]]
+        cols["beam_id"] += ["VB" if v == 0 else f"B{int(v)}" for v in b]
+        cols["beam_type"] += ["vert" if v == 0 else "slant" for v in b]
+        cols["src"] += ["VB" if v == SRC_VB else "BT" for v in t["src"]]
+        cols["freq_khz"] += [int(v) if np.isfinite(v) else 0 for v in t["freq"]]
+        cols["depth"] += [float(v) for v in t["depth"]]
+        cols["ws_elev"] += [float(v) for v in t["ws"]]
+        cols["ws_src"] += [str(v) for v in t["ws_src"]]
+        cols["bed_elev"] += [float(v) for v in t["Z"]]
+        cols["river"] += [str(v) for v in t["river"]]
+        cols["brazo"] += [str(v) for v in t["brazo"]]
+        cols["km_ofic"] += [float(v) for v in t["km_ofic"]]
+        cols["off_axis"] += [float(v) for v in t["off_axis"]]
+        cols["dist_axis"] += [float(v) for v in t["dist_axis"]]
+        cols["t_utc"] += [str(v) for v in t["t_utc"]]
+        cols["spike"] += [int(v) for v in t["spike"]]
+        cols["flag"] += [str(v) for v in t["flag"]]
+        X += list(t["X"]); Y += list(t["Y"])
+    return cols, np.asarray(X), np.asarray(Y)
+
+
+def export_track_cloud(tracks, resumen_dir: Path, args, out_crs, stem="tracks"):
+    """tracks_beam_points.shp (PointZ, Z = bed_elev) + .csv (6.2).
+
+    Unlike survey_raw_beam_points, this layer DOES carry the chainage: there
+    every point of a transect shares one, here it varies point by point and is
+    half the reason the cloud is useful."""
+    cols, X, Y = _track_columns(tracks)
+    n = len(X)
+    if n == 0:
+        return None, None
+    shp = csvp = None
+    if HAS_GPD:
+        gdf = gpd.GeoDataFrame(cols, geometry=[Point(float(X[i]), float(Y[i]),
+                                                     float(cols["bed_elev"][i]))
+                                               for i in range(n)],
+                               crs=CRS.from_user_input(out_crs))
+        use_gpkg = n > CLOUD_SHP_MAX
+        if not use_gpkg:
+            try:
+                shp = resumen_dir / f"{stem}_beam_points.shp"
+                gdf.to_file(shp)
+            except Exception:
+                use_gpkg, shp = True, None
+        if use_gpkg:
+            shp = resumen_dir / f"{stem}_beam_points.gpkg"
+            gdf.to_file(shp, driver="GPKG", layer="beam_points")
+    if str(getattr(args, "tracks_csv", "on")).lower() != "off":
+        csvp = resumen_dir / f"{stem}_beam_points.csv"
+        head = [k for k, _t in TRACK_FIELDS] + ["x_out", "y_out"]
+        with open(csvp, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(head)
+            for i in range(n):
+                row = []
+                for k, typ in TRACK_FIELDS:
+                    v = cols[k][i]
+                    row.append("" if (typ == "f" and not np.isfinite(v))
+                               else (f"{v:.4f}" if typ == "f" else v))
+                row += [f"{X[i]:.4f}", f"{Y[i]:.4f}"]
+                w.writerow(row)
+    return shp, csvp
+
+
+def write_tracks_index(tracks, resumen_dir: Path):
+    """One row per track .mat: class, coverage, GNSS gaps, water surface (6.2)."""
+    path = resumen_dir / "tracks_index.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["archivo", "clase", "origen_clase", "n_ensambles", "n_sin_fix",
+                    "n_puntos", "rios", "km_inicio", "km_fin", "largo_traza_m",
+                    "inicio", "duracion_min", "ws_source", "avisos"])
+        for t in sorted(tracks, key=lambda q: (q["rivers"][:1], q["km_min"]
+                                               if np.isfinite(q["km_min"]) else 0.0)):
+            w.writerow([
+                t["file"], t["clase"], t["clase_src"], t["n_ens"], t["n_nofix"],
+                t["n_pts"], " / ".join(t["rivers"]),
+                "" if not np.isfinite(t["km_min"]) else format_progresiva(t["km_min"]),
+                "" if not np.isfinite(t["km_max"]) else format_progresiva(t["km_max"]),
+                "" if not np.isfinite(t["endspan"]) else f"{t['endspan']:.0f}",
+                "" if t["t_start"] is None else t["t_start"].isoformat(timespec="seconds"),
+                "" if not np.isfinite(t["dur_min"]) else f"{t['dur_min']:.1f}",
+                ", ".join(f"{k} {v}" for k, v in sorted(t["ws_tally"].items())),
+                "; ".join(t["warn"]),
+            ])
+    return path
+
+
+def plot_tracks_planview(tracks, network, results, resumen_dir: Path, out_crs=None):
+    """Track clouds over the centerlines, coloured by class (6.2)."""
+    colors = {"longitudinal": "#1f77b4", "aproximacion": "#ff7f0e",
+              "estatico": "#2ca02c", "otro": "0.45"}
+    X = np.concatenate([t["X"] for t in tracks]) if tracks else np.array([0.0])
+    Y = np.concatenate([t["Y"] for t in tracks]) if tracks else np.array([0.0])
+    pad = 0.08 * max(float(np.ptp(X)), float(np.ptp(Y)), 100.0)
+    x0, x1 = float(X.min()) - pad, float(X.max()) + pad
+    y0, y1 = float(Y.min()) - pad, float(Y.max()) + pad
+    W_IN, L, R, T, B = 11.0, 1.15, 0.30, 1.05, 0.95
+    axw = W_IN - L - R
+    axh = float(np.clip(axw * (y1 - y0) / max(x1 - x0, 1e-9), 2.2, 9.0))
+    want = axh / axw
+    dx, dy = x1 - x0, y1 - y0
+    if dy / dx < want:
+        g = (want * dx - dy) / 2.0
+        y0, y1 = y0 - g, y1 + g
+    else:
+        g = (dy / want - dx) / 2.0
+        x0, x1 = x0 - g, x1 + g
+    H_IN = axh + T + B
+    fig = plt.figure(figsize=(W_IN, H_IN))
+    ax = fig.add_axes([L / W_IN, B / H_IN, axw / W_IN, axh / H_IN])
+    if network is not None:
+        for axr in network.axes:
+            xs, ys = axr.main.xy
+            ax.plot(xs, ys, "-", color="0.62", lw=1.4, zorder=1,
+                    label=f"Eje {axr.river}")
+    for cls in dict.fromkeys(t["clase"] for t in tracks):
+        xs = np.concatenate([t["X"] for t in tracks if t["clase"] == cls])
+        ys = np.concatenate([t["Y"] for t in tracks if t["clase"] == cls])
+        ax.plot(xs, ys, ".", color=colors.get(cls, "0.45"), ms=1.6, alpha=0.55,
+                zorder=2, label=f"{cls} ({len(xs)} pts)")
+    for r in results or []:
+        ax.plot([r["xp"][0], r["xp"][-1]], [r["yp"][0], r["yp"][-1]], "-",
+                color="0.15", lw=1.6, zorder=3,
+                label="Secciones transversales")
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.set_aspect("equal")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    milesep = FuncFormatter(lambda v, _p: f"{v:,.0f}".replace(",", "."))
+    ax.xaxis.set_major_formatter(milesep)
+    ax.yaxis.set_major_formatter(milesep)
+    xlab, ylab = _crs_axis_labels(out_crs if out_crs is not None
+                                  else getattr(network, "crs", None))
+    ax.set_xlabel(xlab); ax.set_ylabel(ylab)
+    ax.grid(True, alpha=0.2, lw=0.6)
+    ax.set_axisbelow(True)
+    fig.text(L / W_IN, 1 - 0.28 / H_IN, "Nube de haces de los recorridos",
+             fontsize=12.5, fontweight="semibold", ha="left", va="top")
+    kms = [t["km_min"] for t in tracks if np.isfinite(t["km_min"])] + \
+          [t["km_max"] for t in tracks if np.isfinite(t["km_max"])]
+    fig.text(L / W_IN, 1 - 0.56 / H_IN,
+             f"{len(tracks)} archivo(s)   ·   "
+             f"{int(sum(t['n_pts'] for t in tracks))} puntos"
+             + (f"   ·   progresivas {format_progresiva(min(kms))} a "
+                f"{format_progresiva(max(kms))}" if kms else ""),
+             fontsize=8.8, color="0.35", ha="left", va="top")
+    _legend_unique(ax, loc="upper right", fontsize=8, markerscale=4,
+                   framealpha=0.85)
+    path = resumen_dir / "tracks_plan_view.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
 
 def gather_matfiles(inputs):
     """Expand CLI inputs (files, folders, globs) into a sorted list of .mat paths."""
@@ -4886,8 +6007,11 @@ def prescan_transects(matfiles, network, args=None, log: list | None = None):
             lon = np.asarray(get_field(gps, "Longitude"), dtype=float).ravel()
             utm = get_field(gps, "UTM")
             utm = np.asarray(utm, dtype=float) if utm is not None else None
+            # 6.2: same GNSS-dropout mask as process_one, so the pre-scan places
+            # the transect from the same positions the run will use
+            lat, lon, utm, _n = _mask_gnss_dropouts(lat, lon, utm)
             utm_crs = auto_utm_crs(lat, lon)
-            if utm is None or utm.ndim != 2 or not np.isfinite(utm).all():
+            if utm is None or utm.ndim != 2 or not np.isfinite(utm).any():
                 tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
                 ex, ny = tr.transform(lon, lat)
                 utm = np.column_stack([ex, ny])
@@ -4896,9 +6020,25 @@ def prescan_transects(matfiles, network, args=None, log: list | None = None):
             stem = Path(m).stem
             force = _manual_river(args, network, stem, log) if args is not None else None
             loc = network.locate_track(tx, ty, force_river=force, method=method)
+            # 6.2: a cross-section covers ~no chainage; a longitudinal run covers
+            # hundreds of metres. Only a warning — nothing is reclassified alone.
+            span = nota = None
+            try:
+                ok = np.isfinite(tx) & np.isfinite(ty)
+                a = network.locate_on(loc["river"], float(tx[ok][0]), float(ty[ok][0]))
+                b = network.locate_on(loc["river"], float(tx[ok][-1]), float(ty[ok][-1]))
+                ends = float(math.hypot(tx[ok][-1] - tx[ok][0], ty[ok][-1] - ty[ok][0]))
+                span = abs(a["km_internal"] - b["km_internal"]) if (a and b) else None
+                if span is not None and span > max(50.0, 1.5 * max(ends, 1.0)):
+                    nota = (f"cubre {span:.0f} m de progresiva contra {ends:.0f} m "
+                            "de traza: parece un recorrido longitudinal, no una "
+                            "sección — ¿va en 'tracks'?")
+            except Exception:
+                pass
             out.append(dict(perfil=stem, river=loc["river"],
                             km_internal=loc["km_internal"], km_oficial=loc["km_oficial"],
-                            dist=loc["dist"], method=loc["method"], note=loc["note"]))
+                            dist=loc["dist"], method=loc["method"], note=loc["note"],
+                            km_span=span, class_note=nota))
         except Exception as e:
             if log is not None:
                 log.append(f"[warn] pre-scan: could not locate {Path(m).name} from its "
@@ -4912,6 +6052,8 @@ def prescan_transects(matfiles, network, args=None, log: list | None = None):
                    "flow-perpendicular section when processed): "
                    + ", ".join(f"{k}: {v}" for k, v in cnt.items()))
         for t in out:
+            if t.get("class_note"):
+                log.append(f"[warn] {t['perfil']}: {t['class_note']}")
             if t["note"] or t["method"] not in ("crossing", "centroid"):
                 tag = "[warn]" if t["method"] == "nearest" else "[info]"
                 log.append(f"{tag} {t['perfil']}: {t['river']} km "
@@ -4931,6 +6073,8 @@ _CONFIG_SKIP_DESTS = {"help", "version", "config"}
 _CONFIG_INPUT_KEYS = ("inputs", "matfiles", "input", "entradas")
 # Config keys that are file/dir paths -> resolved relative to the config file.
 _CONFIG_PATHS = {"outdir", "centerline", "water_surface_csv", "stations", "readings"}
+# 6.2: 'tracks' takes a list of paths/folders/globs, resolved like `inputs`
+_CONFIG_PATH_LISTS = {"tracks"}
 
 # v6: keys of the [grupos] section are group names, values are space/comma
 # separated transect ids (file stems) that must be averaged together. Use it
@@ -5017,6 +6161,12 @@ def load_config(path, parser=None, log: list | None = None):
                     p = Path(it)
                     inputs.append(str(p if p.is_absolute() else (base / p)))
                 continue
+            if key in _CONFIG_PATH_LISTS:                  # 6.2: tracks = ...
+                items = [s.strip() for line in str(val).splitlines()
+                         for s in line.split(",") if s.strip()]
+                params[key] = [str(Path(it) if Path(it).is_absolute() else (base / it))
+                               for it in items]
+                continue
             if key not in schema:
                 log.append(f"[warn] config [{proc}]: unknown key '{raw_key}' — ignored "
                            "(typo? run with --help for the valid options)")
@@ -5075,11 +6225,13 @@ def load_config(path, parser=None, log: list | None = None):
             if ids:
                 manual_groups[str(gname).strip()] = ids
 
-    known = [proc, camp, prog, gsec, _find_section(cp, _RIVER_SECTIONS)]
+    known = [proc, camp, prog, gsec, _find_section(cp, _RIVER_SECTIONS),
+             _find_section(cp, _TRACK_SECTIONS)]          # 6.2: [recorridos]
     for sec in cp.sections():
         if sec not in known:
             log.append(f"[warn] config: unknown section [{sec}] — ignored (valid: "
-                       "[campanha], [procesamiento], [progresivas], [grupos], [rios])")
+                       "[campanha], [procesamiento], [progresivas], [grupos], "
+                       "[rios], [recorridos])")
 
     return params, campania, river_offsets, manual_groups
 
@@ -5103,6 +6255,36 @@ def load_river_overrides(path):
         return {}
     return {str(k).strip(): str(v).strip() for k, v in cp.items(sec)
             if v is not None and str(v).strip()}
+
+
+_TRACK_SECTIONS = ["recorridos", "recorrido", "tracks"]
+TRACK_CLASSES = ("longitudinal", "aproximacion", "estatico", "otro")
+
+
+def load_track_overrides(path):
+    """{track id: (class, river|None)} from the INI [recorridos] section (6.2).
+
+    Optional: the classifier labels every track on its own. This is only for
+    the case it gets wrong, and for forcing the river of a track measured at a
+    confluence.  '<id> = <clase> | <rio>'"""
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    try:
+        cp.read(Path(path), encoding="utf-8")
+    except Exception:
+        return {}
+    sec = _find_section(cp, _TRACK_SECTIONS)
+    if not sec:
+        return {}
+    out = {}
+    for k, v in cp.items(sec):
+        if not v or not str(v).strip():
+            continue
+        parts = [q.strip() for q in str(v).split("|")]
+        cls = _norm_name(parts[0]).replace(" ", "")
+        cls = cls if cls in TRACK_CLASSES else "otro"
+        out[str(k).strip()] = (cls, parts[1] if len(parts) > 1 and parts[1] else None)
+    return out
 
 
 def _git_commit(start_path):
@@ -5303,6 +6485,16 @@ def build_parser():
                         "robust at confluences. 'centroid': nearest axis to the track "
                         "centroid (v6.0 rule, reproduces old chainages). The INI "
                         "[rios] section forces the river of a given transect.")
+    # --- 6.2: coordinate reference systems ---
+    p.add_argument("--out-crs", default=None,
+                   help="6.2: CRS of EVERY output of the run — per-transect CSV and "
+                        "shapefiles, survey layers, track cloud, plot axes. Default: "
+                        "the centerline's CRS; EPSG:5344 if it has none. Must be "
+                        "projected and metric. v6.1 picked a POSGAR faja per "
+                        "transect while stamping 5344 on the survey layers.")
+    p.add_argument("--centerline-crs", default=None,
+                   help="6.2: declare the centerline's CRS when the .prj is missing "
+                        "(v6.1 inherited None and assumed everything matched).")
     p.add_argument("--chainage-reverse", action="store_true",
                    help="Measure chainage from the centerline's LAST vertex "
                         "(ignored where a water-surface CSV is given, since each "
@@ -5317,6 +6509,33 @@ def build_parser():
     p.add_argument("--ws-elev-col", default="H_correg", help="WS CSV elevation column (default 'H_correg').")
     p.add_argument("--ws-crs", default="EPSG:5344",
                    help="CRS of the WS CSV coordinates (default EPSG:5344 = POSGAR07 f2).")
+    p.add_argument("--stations-crs", default=None,
+                   help="6.2: CRS of a station registry given as CSV (X/Y columns). "
+                        "Defaults to --ws-crs, which is what v6.1 forced — a problem "
+                        "when the registry and the GNSS points are in different "
+                        "fajas. A vector registry uses its own .prj.")
+    p.add_argument("--ws-slope-min-span", type=float, default=WS_SLOPE_MIN_SPAN_DEFAULT,
+                   help="6.2: minimum separation [m] between the water-surface "
+                        "values used to define the slope that continues the "
+                        f"surface beyond them (default {WS_SLOPE_MIN_SPAN_DEFAULT:.0f}).")
+    p.add_argument("--ws-slope-max", type=float, default=WS_SLOPE_MAX_DEFAULT,
+                   help="6.2: physically admissible band [m/km] for that slope; "
+                        "outside it the whole-path fit, then --ws-default-slope, "
+                        f"is used (default {WS_SLOPE_MAX_DEFAULT:.1f}).")
+    p.add_argument("--ws-default-slope", default="auto",
+                   help="6.2: fallback slope [m/km, negative downstream] when a "
+                        "path cannot define one. 'auto' (default) takes the fit "
+                        "of the path whose values span the most.")
+    p.add_argument("--gps-max-gap", type=float, default=0.30,
+                   help="6.2: fraction of ensembles without a GNSS fix (0/0) above "
+                        "which a transect is not processed (default 0.30).")
+    p.add_argument("--allow-gps-gaps", action="store_true",
+                   help="6.2: process a transect anyway, past --gps-max-gap.")
+    p.add_argument("--time-epoch", default="auto",
+                   choices=["auto", "sontek", "unix", "datenum"],
+                   help="6.2: encoding of System.Time. The ranges overlap, so "
+                        "'auto' resolves them against the file-name timestamp "
+                        "(YYYYMMDDhhmmss) and falls back to 'sontek'.")
     p.add_argument("--datum-name", default=DATUM_NAME_DEFAULT,
                    help=f"Vertical datum label for plots/columns (default '{DATUM_NAME_DEFAULT}').")
     # --- hydrometric stations (secondary water surface: fallback/gap-fill/QC) ---
@@ -5348,6 +6567,36 @@ def build_parser():
                         f"(default {OFFSET_SCALE_DEFAULT}; larger = gentler).")
     p.add_argument("--no-offset-weighting", action="store_true",
                    help="Disable the perpendicular-offset penalty entirely.")
+    # --- 6.2: beam cloud of the non-transect .mat files (recorridos) ---
+    p.add_argument("--tracks", nargs="*", default=None,
+                   help="6.2: .mat files that are NOT cross-sections — longitudinal "
+                        "runs between sections, approaches, repositioning, static "
+                        "measurements. Folder, files or glob. Their beam footprints "
+                        "are exported as ONE categorised point cloud (shapefile + "
+                        "CSV) with river, official chainage, signed offset from the "
+                        "axis and a per-point water surface. They do not enter the "
+                        "survey index, the aforo grouping or the longitudinal "
+                        "profile.")
+    p.add_argument("--tracks-beams", default="all", choices=["all", "vb", "slant"],
+                   help="6.2: which beams to export (default 'all'; the beam_id "
+                        "field lets you filter to VB later in GIS).")
+    p.add_argument("--tracks-decimate", type=int, default=1,
+                   help="6.2: keep 1 of every N ensembles of a track (default 1).")
+    p.add_argument("--tracks-thin", type=float, default=0.0,
+                   help="6.2: thin the exported cloud to one point per cell of this "
+                        "size [m] (default 0 = off).")
+    p.add_argument("--tracks-csv", default="on", choices=["on", "off"],
+                   help="6.2: also write tracks_beam_points.csv (default on).")
+    p.add_argument("--tracks-per-file", action="store_true",
+                   help="6.2: also write one shapefile/CSV per track file.")
+    p.add_argument("--tracks-locate-tol", type=float, default=250.0,
+                   help="6.2: beyond this distance [m] from every axis a track point "
+                        "keeps its bed elevation but gets no chainage, flagged "
+                        "OFF_AXIS (default 250).")
+    p.add_argument("--tracks-feed-sections", action="store_true",
+                   help="6.2: NOT implemented on purpose — feeding track points into "
+                        "the cross-section clouds would change validated profiles. "
+                        "Accepted so the key does not break an INI; it warns.")
     return p
 
 
@@ -5499,6 +6748,8 @@ def _run(runlog):
     args.manual_groups = manual_groups        # v6: [grupos] override
     args.manual_rivers = (load_river_overrides(pre_args.config)   # 6.1: [rios]
                           if pre_args.config else {})
+    args.track_overrides = (load_track_overrides(pre_args.config)  # 6.2: [recorridos]
+                            if pre_args.config else {})
     datum_name = args.datum_name
 
     if not args.matfiles:
@@ -5545,6 +6796,7 @@ def _run(runlog):
     # --- river network (multi-river centerline) --------------------------- #
     network = None
     ws_pts_net = None
+    net_crs = None
     if args.centerline:
         if not HAS_GPD:
             sys.exit("[error] --centerline needs geopandas/shapely installed")
@@ -5552,6 +6804,20 @@ def _run(runlog):
             net_crs = gpd.read_file(args.centerline).crs
         except Exception as e:
             sys.exit(f"[error] could not read centerline: {e}")
+        if args.centerline_crs:
+            net_crs = CRS.from_user_input(args.centerline_crs)
+            setup_log.append(f"[info] CRS del eje declarado por --centerline-crs: "
+                             f"{net_crs.to_string()}")
+        elif net_crs is None:
+            setup_log.append("[warn] the centerline has no CRS (.prj missing): "
+                             "declare it with --centerline-crs")
+        # 6.2: a geographic centerline would make every chainage, tolerance and
+        # distance in the pipeline a number of DEGREES, with no warning in v6.1
+        if net_crs is not None and not crs_is_metric(net_crs):
+            sys.exit(f"[error] the centerline is in {CRS.from_user_input(net_crs).to_string()}, "
+                     "which is not a projected metric CRS: chainages and tolerances "
+                     "would be in degrees. Reproject it (e.g. to EPSG:5344) or "
+                     "declare the right CRS with --centerline-crs.")
         if ws_table is not None:
             if net_crs is not None and CRS.from_user_input(args.ws_crs) != net_crs:
                 tr = Transformer.from_crs(args.ws_crs, net_crs, always_xy=True)
@@ -5572,6 +6838,21 @@ def _run(runlog):
         # --chainage-offset is the global fallback for rivers with no INI offset
         for ax in network.axes:
             network.river_offsets.setdefault(ax.river, float(args.chainage_offset))
+        # 6.2: is --ws-crs really the CRS of the WS CSV?
+        if ws_table:
+            ok, msg = check_crs_plausibility(
+                [(p["x"], p["y"]) for p in ws_table], network, args.ws_crs,
+                "CSV de pelo de agua", log=setup_log, src_crs="--ws-crs")
+            if not ok:
+                print("\n".join(setup_log))
+                sys.exit(f"[error] {msg}.")
+
+    # --- 6.2: ONE output CRS for the whole run --------------------------- #
+    out_crs = resolve_out_crs(args.out_crs, net_crs if args.centerline else None,
+                              log=setup_log)
+    args.out_crs_obj = out_crs
+    # the record must show the CRS actually used, not the (often empty) flag
+    args.out_crs = out_crs.to_string()
 
     # --- 6.1: transects located from their GPS (section crossing), paths ranked
     # for display only — the water surface needs no trunk.
@@ -5605,8 +6886,9 @@ def _run(runlog):
                              "readings to build a water surface — stations ignored")
         else:
             try:
-                registry = StationRegistry(args.stations, network,
-                                           crs_override=args.ws_crs, log=setup_log)
+                registry = StationRegistry(
+                    args.stations, network,
+                    crs_override=(args.stations_crs or args.ws_crs), log=setup_log)
                 mode, rdata = read_level_readings(args.readings)
                 station_ws = StationWS(registry, mode, rdata, log=setup_log)
             except Exception as e:
@@ -5616,9 +6898,15 @@ def _run(runlog):
     # --- water-surface model (GNSS + gauges on the network paths) ---------- #
     wsm = None
     if network is not None and (ws_pts_net or station_ws is not None):
+        _dslope = None
+        if str(args.ws_default_slope).strip().lower() not in ("auto", ""):
+            _dslope = float(args.ws_default_slope) / 1000.0
         wsm = WaterSurfaceModel(network, points=ws_pts_net, station_ws=station_ws,
                                 qc_tol=args.ws_qc_tol, skipped=ws_skipped,
-                                log=setup_log, extrap_tol=args.ws_extrap_tol)
+                                log=setup_log, extrap_tol=args.ws_extrap_tol,
+                                slope_min_span=args.ws_slope_min_span,
+                                slope_max=args.ws_slope_max / 1000.0,
+                                default_slope=_dslope)
     elif ws_table is not None and network is None:
         setup_log.append("[warn] --water-surface-csv ignored: needs --centerline")
 
@@ -5666,7 +6954,7 @@ def _run(runlog):
     # =============================== single transect ======================= #
     if not survey_mode:
         r = process_one(matfiles[0], args, network=network, wsp=wsm,
-                        station_ws=station_ws, datum_name=datum_name)
+                        station_ws=station_ws, out_crs=out_crs, datum_name=datum_name)
         if r is not None:
             rec = write_run_record(r["outdir"], args, campania, matfiles,
                                    river_offsets=river_offsets, setup_lines=setup_log,
@@ -5684,7 +6972,8 @@ def _run(runlog):
     results = []
     for i, m in enumerate(matfiles, 1):
         r = process_one(m, args, network=network, wsp=wsm, station_ws=station_ws,
-                        datum_name=datum_name, survey_outdir=survey_root, quiet=True)
+                        out_crs=out_crs, datum_name=datum_name,
+                        survey_outdir=survey_root, quiet=True)
         if r is None:
             print(f"  [{i}/{len(matfiles)}] {m.name}: FAILED "
                   f"(see {Path(m.stem) / 'process_log.txt'})")
@@ -5739,30 +7028,89 @@ def _run(runlog):
     if tally.get("none"):
         print(f"[warn] {tally['none']} perfil(es) SIN pelo de agua: cotas RELATIVAS")
 
+    # 6.2: deterministic brazo colours — registered once, before any plot
+    set_brazo_order([r.get("brazo") for r in results]
+                    + [b.get("label") for ax in (network.axes if network else [])
+                       for b in ax.anabranches])
+
     # aggregates
     idx = write_survey_index(results, resumen, datum_name)
     prof = write_survey_profiles(results, resumen)
     print(f"[ok ] {idx.relative_to(survey_root)}")
     print(f"[ok ] {prof.relative_to(survey_root)}")
-    pv = plot_survey_planview(results, network, resumen)
+    pv = plot_survey_planview(results, network, resumen, out_crs=out_crs)
     print(f"[ok ] {pv.relative_to(survey_root)}")
     lp = plot_long_profile(results, wsm, resumen, datum_name, network=network)
     if lp:
         print(f"[ok ] {lp.relative_to(survey_root)}")
     if HAS_GPD:
-        sax, spp = export_survey_shapefiles(results, resumen, datum_name)
+        sax, spp = export_survey_shapefiles(results, resumen, datum_name,
+                                            out_crs=out_crs)
         if sax:
             print(f"[ok ] {sax.relative_to(survey_root)}")
         if spp:
             print(f"[ok ] {spp.relative_to(survey_root)}")
-        cloud = export_survey_beam_cloud(results, resumen)
+        cloud = export_survey_beam_cloud(results, resumen, out_crs=out_crs)
         if cloud:
             print(f"[ok ] {cloud.relative_to(survey_root)}")
+
+    # ------------------------------------------------------------------ 6.2
+    # RECORRIDOS: beam cloud of the non-transect .mat files. Parallel output;
+    # nothing above this point sees them.
+    track_lines = []
+    tracks = []
+    if args.tracks:
+        if args.tracks_feed_sections:
+            print("[warn] --tracks-feed-sections no está implementado a propósito: "
+                  "meter puntos de recorrido en las nubes de las secciones "
+                  "cambiaría perfiles ya validados. Se ignora.")
+        tfiles = gather_matfiles(args.tracks)
+        stems = {m.stem for m in matfiles}
+        tfiles = [m for m in tfiles if m.stem not in stems]
+        if not tfiles:
+            print("[warn] 'tracks': no se encontró ningún .mat (o todos ya están "
+                  "en 'inputs')")
+        else:
+            print(f"[recorridos] {len(tfiles)} archivo(s)")
+            for m in tfiles:
+                t = process_track(m, args, network=network, wsm=wsm, out_crs=out_crs,
+                                  override=args.track_overrides.get(m.stem),
+                                  log=track_lines)
+                if t is not None:
+                    tracks.append(t)
+            for line in track_lines:
+                print(line)
+        if tracks:
+            ti = write_tracks_index(tracks, resumen)
+            print(f"[ok ] {ti.relative_to(survey_root)}")
+            shp, csvp = export_track_cloud(tracks, resumen, args, out_crs)
+            for q in (shp, csvp):
+                if q:
+                    print(f"[ok ] {q.relative_to(survey_root)}")
+            if args.tracks_per_file:
+                for t in tracks:
+                    d = survey_root / "recorridos" / t["file"]
+                    d.mkdir(parents=True, exist_ok=True)
+                    export_track_cloud([t], d, args, out_crs, stem=t["file"])
+            tpv = plot_tracks_planview(tracks, network, results, resumen,
+                                       out_crs=out_crs)
+            print(f"[ok ] {tpv.relative_to(survey_root)}")
+            n_pts = int(sum(t["n_pts"] for t in tracks))
+            cls = {}
+            for t in tracks:
+                cls[t["clase"]] = cls.get(t["clase"], 0) + 1
+            track_lines.append(
+                f"[info] recorridos: {len(tracks)} archivo(s), {n_pts} puntos ("
+                + ", ".join(f"{k} {v}" for k, v in sorted(cls.items())) + ")")
+            print(track_lines[-1])
 
     # traceability record for the whole survey
     summary = [ws_line, "", f"[resumen] {len(results)} transectas procesadas:"]
     for r in sorted(results, key=_sort_key):
         summary.append("    " + _line_label(r))
+    if track_lines:
+        summary += ["", "[resumen] recorridos (nube de haces):"] + \
+                   ["    " + q for q in track_lines]
     twarn = collect_transect_warnings(
         all_transects + [r for r in results if r.get("is_group")])
     rec = write_run_record(resumen, args, campania, matfiles,
