@@ -257,7 +257,7 @@ except Exception as e:
 DATUM_NAME_DEFAULT = "IGN SRVN16"
 
 # Script version (reported in logs and the traceability record).
-__version__ = "6.2"
+__version__ = "6.3"
 
 # 6.1: water-surface extrapolation beyond the last value of a path (slope
 # continuation) is reported as a WARNING only past this distance [m]; shorter
@@ -825,6 +825,11 @@ def merge_group_clouds(group):
     # were already reprojected per member (process_group); the cloud was not.
     ref_crs = next((r["utm_crs"] for r in group if r.get("cloud")), None)
     out = {}
+    # 6.3: which repetition each point came from — needed by measured_extent()
+    # and useful to colour the merged cloud by pass
+    reps = [np.full(len(np.asarray(r["cloud"]["E"])), k, dtype=int)
+            for k, r in enumerate(group) if r.get("cloud")]
+    out["rep"] = np.concatenate(reps) if reps else np.array([], dtype=int)
     for k in keys:
         parts = []
         for r in group:
@@ -3421,6 +3426,59 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     return float(v[np.searchsorted(cw, cutoff)])
 
 
+EXTENT_MIN_PTS = 3          # valid points a beam needs to define an extent
+
+
+def measured_extent(s_pts, depth_pts, beam_index=None, rep=None, primary=None,
+                    mode="mean", use_primary=True, log=None):
+    """6.3: where the MEASURED bed ends on each side of the section.
+
+    v6.2 took the outermost point of the whole cloud (`max`). A maximum over a
+    set is biased outward and GROWS with the number of samples: in an aforo the
+    samples are the repetitions, so a 4-pass group was systematically wider than
+    any of its 4 passes, and a 6-pass one wider still. Within a single transect
+    the same bias exists over the 5 beams — the fore beam's footprint sits
+    r = depth*tan(25 deg) beyond the boat, so it always wins the max.
+
+    `mode='mean'` instead takes, for each (repetition, beam), the outermost
+    valid point on each side, and averages those estimates. The fore/aft
+    footprint offsets are symmetric, so averaging cancels them and the result
+    does not depend on how many passes were run. `mode='max'` reproduces v6.2.
+
+    Returns (s_min, s_max, detail) where detail lists the per-group extents."""
+    s = np.asarray(s_pts, dtype=float)
+    d = np.asarray(depth_pts, dtype=float)
+    ok = np.isfinite(s) & np.isfinite(d) & (d > 0)
+    if use_primary and primary is not None:
+        ok = ok & np.asarray(primary, dtype=bool)
+    if not np.any(ok):
+        return float("nan"), float("nan"), []
+    if str(mode).lower() != "mean":
+        return float(np.min(s[ok])), float(np.max(s[ok])), []
+
+    b = (np.zeros(s.size, dtype=int) if beam_index is None
+         else np.asarray(beam_index, dtype=int))
+    r = (np.zeros(s.size, dtype=int) if rep is None
+         else np.asarray(rep, dtype=int))
+    mins, maxs, detail = [], [], []
+    for key in sorted({(int(rv), int(bv)) for rv, bv in zip(r[ok], b[ok])}):
+        m = ok & (r == key[0]) & (b == key[1])
+        if int(np.count_nonzero(m)) < EXTENT_MIN_PTS:
+            continue
+        lo, hi = float(np.min(s[m])), float(np.max(s[m]))
+        mins.append(lo); maxs.append(hi)
+        detail.append(dict(rep=key[0], beam=key[1], s_min=lo, s_max=hi,
+                           n=int(np.count_nonzero(m))))
+    if not mins:                                   # nothing qualified: fall back
+        return float(np.min(s[ok])), float(np.max(s[ok])), []
+    lo, hi = float(np.mean(mins)), float(np.mean(maxs))
+    if log is not None:
+        log.append(f"[info] extensión medida (promedio de {len(mins)} "
+                   f"combinaciones repetición×haz): s = {lo:.2f} a {hi:.2f} m "
+                   f"(envolvente: {np.min(s[ok]):.2f} a {np.max(s[ok]):.2f} m)")
+    return lo, hi, detail
+
+
 def build_profile(
     s_pts: np.ndarray, depth_pts: np.ndarray, w_pts: np.ndarray,
     s_data_min: float, s_data_max: float, dx: float = 0.5,
@@ -3433,6 +3491,7 @@ def build_profile(
     composite: bool = True,
     primary_min: int = 1,
     edge_anchor: str = "ref",
+    ref_extent: tuple[float, float] | None = None,
     vb_priority: bool | None = None,
     vb_min: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -3489,7 +3548,11 @@ def build_profile(
     # (edge_left/right metres beyond it). With edge_anchor='cloud' the full
     # cloud sets the extent instead.
     ref_min, ref_max = s_data_min, s_data_max
-    if edge_anchor == "ref" and _pri is not None:
+    # 6.3: the caller resolves the extent with measured_extent() and passes it
+    # here, so one rule covers single transects and aforo groups alike.
+    if ref_extent is not None and all(np.isfinite(ref_extent)):
+        ref_min, ref_max = float(ref_extent[0]), float(ref_extent[1])
+    elif edge_anchor == "ref" and _pri is not None:
         _ok = (np.isfinite(s_pts) & np.isfinite(depth_pts)
                & (depth_pts > 0) & _pri)
         if np.any(_ok):
@@ -4285,6 +4348,10 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
                                        centroid=centroid, log=log, river=river)
 
     # ------------------------------------------------------------ STEP 5
+    ext_lo, ext_hi, _ext_det = measured_extent(
+        s_pts, cloud["depth"], beam_index=cloud["beam_index"],
+        primary=cloud["primary"], mode=args.edge_extent,
+        use_primary=(args.edge_anchor == "ref"), log=log)
     s_grid, depth_grid, s_shift, src_grid = build_profile(
         s_pts, cloud["depth"], eff_weight,
         s_data_min, s_data_max, dx=args.dx,
@@ -4293,7 +4360,7 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         beam_index=cloud["beam_index"],
         primary=cloud["primary"], src=cloud["src"],
         composite=composite_on, primary_min=args.vb_min,
-        edge_anchor=args.edge_anchor,
+        edge_anchor=args.edge_anchor, ref_extent=(ext_lo, ext_hi),
     )
     bhw = args.bin_half_width if args.bin_half_width is not None else 2 * args.dx
     s_pts_final = s_pts + s_shift
@@ -4486,6 +4553,20 @@ def plot_group_qc(outdir: Path, gid: str, s_grid, depth_grid, stack, sigma,
     return path
 
 
+def _rep_extent_cols(rep_extent):
+    """6.3: measured extent of each repetition on the common axis, its spread,
+    and the averages that actually anchor the bank ramps."""
+    nan = float("nan")
+    if not rep_extent:
+        return f"{nan},{nan},{nan},{nan},\"\",\"\","
+    los = [q[0] for q in rep_extent]
+    his = [q[1] for q in rep_extent]
+    return (f"{np.mean(los):.3f},{np.mean(his):.3f},"
+            f"{np.ptp(los):.3f},{np.ptp(his):.3f},"
+            + "\"" + ";".join(f"{v:.3f}" for v in los) + "\","
+            + "\"" + ";".join(f"{v:.3f}" for v in his) + "\",")
+
+
 def write_group_qc_csv(groups_out, resumen_dir: Path):
     """One row per aforo group: repeatability statistics."""
     path = resumen_dir / "grupos_qc.csv"
@@ -4494,6 +4575,8 @@ def write_group_qc_csv(groups_out, resumen_dir: Path):
                 "dispersion_progresiva_m,ancho_m,sigma_media_m,sigma_max_m,"
                 "rms_por_repeticion_m,theta_section_deg,dispersion_theta_deg,"
                 "sigma_media_comun_m,sigma_max_comun_m,"
+                "s_min_medio_m,s_max_medio_m,disp_s_min_m,disp_s_max_m,"
+                "s_min_por_repeticion_m,s_max_por_repeticion_m,"
                 "q_media_m3s,q_desvio_m3s,q_cv_pct,q_min_m3s,q_max_m3s,"
                 "q_por_repeticion_m3s\n")
         for g in groups_out:
@@ -4517,7 +4600,8 @@ def write_group_qc_csv(groups_out, resumen_dir: Path):
                     f"{g.get('theta_spread_deg', float('nan')):.2f},"
                     f"{g.get('sigma_mean_common', float('nan')):.4f},"
                     f"{g.get('sigma_max_common', float('nan')):.4f},"
-                    f"{q.get('q_mean', float('nan')):.3f},"
+                    + _rep_extent_cols(g.get("rep_extent"))
+                    + f"{q.get('q_mean', float('nan')):.3f},"
                     f"{q.get('q_std', float('nan')):.3f},"
                     f"{q.get('q_cov_pct', float('nan')):.2f},"
                     f"{q.get('q_min', float('nan')):.3f},"
@@ -4576,6 +4660,13 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
     edge_r = float(np.nanmedian([r["edge_r"] for r in group]))
     log.append(f"[info] márgenes (mediana del grupo): izq={edge_l:.2f} m, der={edge_r:.2f} m")
 
+    # 6.3: the extent is the AVERAGE of the per-(repetition x beam) extents on
+    # the common axis, not the envelope of the merged cloud. v6.2 made a group
+    # systematically wider than any of its own repetitions.
+    ext_lo, ext_hi, ext_det = measured_extent(
+        s_pts, cloud["depth"], beam_index=cloud["beam_index"],
+        rep=cloud.get("rep"), primary=cloud["primary"], mode=args.edge_extent,
+        use_primary=(args.edge_anchor == "ref"), log=log)
     s_grid, depth_grid, s_shift, src_grid = build_profile(
         s_pts, cloud["depth"], eff_weight,
         float(np.nanmin(s_pts)), float(np.nanmax(s_pts)), dx=args.dx,
@@ -4583,8 +4674,24 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         edge_left_dist=edge_l, edge_right_dist=edge_r,
         beam_index=cloud["beam_index"], primary=cloud["primary"], src=cloud["src"],
         composite=ref.get("composite", True), primary_min=args.vb_min,
-        edge_anchor=args.edge_anchor,
+        edge_anchor=args.edge_anchor, ref_extent=(ext_lo, ext_hi),
     )
+    # per-repetition extents, for grupos_qc.csv: if one pass is far from the
+    # others it should be a column, not something you infer from the grey band
+    _rep_lo, _rep_hi = {}, {}
+    for q in ext_det:
+        _rep_lo.setdefault(q["rep"], []).append(q["s_min"])
+        _rep_hi.setdefault(q["rep"], []).append(q["s_max"])
+    rep_extent = [(float(np.mean(_rep_lo[k])), float(np.mean(_rep_hi[k])))
+                  for k in sorted(_rep_lo)]
+    if len(rep_extent) > 1:
+        _sp_l = float(np.ptp([q[0] for q in rep_extent]))
+        _sp_r = float(np.ptp([q[1] for q in rep_extent]))
+        log.append(f"[info] dispersión del extremo medido entre repeticiones: "
+                   f"izq {_sp_l:.2f} m, der {_sp_r:.2f} m")
+        if max(_sp_l, _sp_r) > 5.0:
+            log.append(f"[warn] una repetición cubrió {max(_sp_l, _sp_r):.1f} m "
+                       "más que otra: revisar grupos_qc.csv")
     Ec, Nc = centroid
     axis_origin = (Ec - s_shift * ux_LR, Nc - s_shift * uy_LR)
 
@@ -4737,6 +4844,7 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         ws_elev=ws_elev, ws_note=ws_note, ws_source=ws_source,
         s_grid=s_grid, depth_grid=depth_grid, bed_elev=bed,
         xp=geo["xp"], yp=geo["yp"],
+        rep_extent=rep_extent,
         width_m=float(s_grid[-1] - s_grid[0]),
         thalweg_elev=thalweg_elev, max_depth=float(np.nanmax(depth_grid)),
         theta_flow=theta_flow, theta_section=theta_section_final,
@@ -4885,6 +4993,44 @@ def _px_samples(ax, xs, ys, step_px=3.0):
     return np.vstack(out)
 
 
+def _thin_labels(ax, sections, mode="auto", min_sep_px=30.0):
+    """6.3: decide WHICH sections get a chainage label.
+
+    v6.2 tried to place all of them and only dropped a label when no free spot
+    existed, which on a 56-section campaign left the crowded reaches unreadable
+    while the open ones gained nothing. Thinning is by DENSITY in pixels, not
+    'one in N': the sparse reaches keep every label, a cluster keeps one, and
+    the result adapts by itself to the scale actually drawn.
+
+    'all' labels everything (v6.2), 'every:N' takes one in N, 'none' labels
+    nothing. Returns (kept, dropped)."""
+    mode = str(mode or "auto").strip().lower()
+    if mode == "none":
+        return [], list(sections)
+    if mode == "all":
+        return list(sections), []
+    if mode.startswith("every:"):
+        try:
+            n = max(1, int(mode.split(":", 1)[1]))
+        except ValueError:
+            n = 1
+        return list(sections[::n]), [s for i, s in enumerate(sections) if i % n]
+    kept, dropped, last, prev = [], [], None, None
+    for sec in sections:                       # already in chainage order
+        p = ax.transData.transform((sec[0][2], sec[0][3]))
+        far_from_kept = last is None or float(np.hypot(*(p - last))) >= min_sep_px
+        # ...or it OPENS a cluster: without this clause a whole cluster sitting
+        # within min_sep of the previous labelled section gets no label at all
+        opens_run = prev is None or float(np.hypot(*(p - prev))) >= min_sep_px
+        if far_from_kept or opens_run:
+            kept.append(sec)
+            last = p
+        else:
+            dropped.append(sec)
+        prev = p
+    return kept, dropped
+
+
 def _place_labels(fig, ax, sections, obstacles, fontsize=7.2, pad=2.5):
     """6.2: chainage labels placed so they touch nothing.
 
@@ -4959,6 +5105,42 @@ def _place_labels(fig, ax, sections, obstacles, fontsize=7.2, pad=2.5):
     return placed
 
 
+def _thousands_axes(ax, threshold=2000.0):
+    """6.3: draw projected coordinates in thousands with a x10^3 marker at the
+    end of each axis, instead of seven digits per tick.
+
+    POSGAR eastings run to 2.582.000: seven figures to tell apart reaches 2 km
+    apart. Below `threshold` of extent the tick step is small enough that plain
+    metres read better, so the scaling is skipped. The number of decimals comes
+    from the TICK STEP, not fixed: at a 2 km step they are integers, at a 50 m
+    step two decimals are needed. Returns True when scaling was applied."""
+    span = max(float(np.ptp(ax.get_xlim())), float(np.ptp(ax.get_ylim())))
+    if span < threshold:
+        ax.ticklabel_format(style="plain", useOffset=False)
+        f = FuncFormatter(lambda v, _p: f"{v:,.0f}".replace(",", "."))
+        ax.xaxis.set_major_formatter(f)
+        ax.yaxis.set_major_formatter(f)
+        return False
+
+    def _dec(axis):
+        t = np.asarray(axis.get_ticklocs(), dtype=float)
+        step = float(np.min(np.diff(t))) / 1000.0 if t.size > 1 else 1.0
+        return int(min(3, max(0, math.ceil(-math.log10(step)) if step < 1 else 0)))
+
+    ax.ticklabel_format(style="plain", useOffset=False)
+    for axis in (ax.xaxis, ax.yaxis):
+        d = _dec(axis)
+        # NO thousands separator on the scaled value: 2610 must not print
+        # '2.610', which next to a x10^3 marker reads like 2,61
+        axis.set_major_formatter(FuncFormatter(
+            lambda v, _p, _d=d: f"{v / 1000.0:.{_d}f}"))
+    ax.text(1.0, -0.052, "×10³ m", transform=ax.transAxes, ha="right",
+            va="top", fontsize=8, color="0.35")
+    ax.text(0.0, 1.012, "×10³ m", transform=ax.transAxes, ha="right",
+            va="bottom", fontsize=8, color="0.35")
+    return True
+
+
 def _crs_axis_labels(crs):
     """('Este <crs> [m]', 'Norte <crs> [m]') for the run's output CRS (6.2:
     v6.1 hard-coded 'POSGAR07 f2' whatever it actually wrote)."""
@@ -4972,7 +5154,8 @@ def _crs_axis_labels(crs):
     return f"Este {tag} [m]", f"Norte {tag} [m]"
 
 
-def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None):
+def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None,
+                         args_labels=None):
     """Centerlines + every section axis, coloured by brazo, labelled by the
     river's official chainage.
 
@@ -5056,10 +5239,7 @@ def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None):
     ax.set_xlim(x0, x1)
     ax.set_ylim(y0, y1)
     ax.set_aspect("equal")
-    ax.ticklabel_format(style="plain", useOffset=False)
-    milesep = FuncFormatter(lambda v, _p: f"{v:,.0f}".replace(",", "."))
-    ax.xaxis.set_major_formatter(milesep)
-    ax.yaxis.set_major_formatter(milesep)
+    _thousands_axes(ax)
     xlab, ylab = _crs_axis_labels(out_crs if out_crs is not None
                                   else getattr(network, "crs", None))
     ax.set_xlabel(xlab)
@@ -5105,7 +5285,11 @@ def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None):
     obs = [_px_samples(ax, xs, ys) for xs, ys in drawn]
     obs.append(_px_samples(ax, [bx, bx + L_bar], [by, by]))
     obs = [o for o in obs if len(o)]
-    _place_labels(fig, ax, sections,
+    keep, drop = _thin_labels(ax, sections,
+                              mode=getattr(args_labels, "planview_labels", "auto"))
+    for (_xa, _ya, xb, yb), _t, col in drop:      # unlabelled sections keep a tick
+        ax.plot([xb], [yb], ".", color=col, ms=3.0, zorder=5)
+    _place_labels(fig, ax, keep,
                   np.vstack(obs) if obs else np.zeros((0, 2)))
 
     path = resumen_dir / "survey_plan_view.png"
@@ -5939,10 +6123,7 @@ def plot_tracks_planview(tracks, network, results, resumen_dir: Path, out_crs=No
     ax.set_xlim(x0, x1)
     ax.set_ylim(y0, y1)
     ax.set_aspect("equal")
-    ax.ticklabel_format(style="plain", useOffset=False)
-    milesep = FuncFormatter(lambda v, _p: f"{v:,.0f}".replace(",", "."))
-    ax.xaxis.set_major_formatter(milesep)
-    ax.yaxis.set_major_formatter(milesep)
+    _thousands_axes(ax)
     xlab, ylab = _crs_axis_labels(out_crs if out_crs is not None
                                   else getattr(network, "crs", None))
     ax.set_xlabel(xlab); ax.set_ylabel(ylab)
@@ -6400,6 +6581,20 @@ def build_parser():
     p.add_argument("--water-surface-elev", type=float, default=0.0,
                    help="Constant water-surface elevation [m] used only when no "
                         "--water-surface-csv is given (bed_elev = WSE - depth).")
+    p.add_argument("--planview-labels", default="auto",
+                   help="6.3: which sections get a chainage label in "
+                        "survey_plan_view.png. 'auto' (default) thins by density "
+                        "so a cluster does not pile up while open reaches keep "
+                        "every label; 'all' labels all (v6.2); 'every:N' one in "
+                        "N; 'none'. Unlabelled sections keep a tick and are in "
+                        "survey_index.csv.")
+    p.add_argument("--edge-extent", default="mean", choices=["mean", "max"],
+                   help="6.3: how the extent of the MEASURED bed is resolved "
+                        "before the bank ramps are drawn. 'mean' (default): "
+                        "average of the outermost valid point of each "
+                        "(repetition x beam). 'max': outermost point of the "
+                        "whole cloud, the v6.2 rule — biased outward and growing "
+                        "with the number of repetitions and beams.")
     p.add_argument("--no-edge-extrapolation", action="store_true",
                    help="Disable bank extrapolation to depth=0 from Setup.Edges_*.")
     p.add_argument("--blend-beams", action="store_true",
@@ -7038,7 +7233,8 @@ def _run(runlog):
     prof = write_survey_profiles(results, resumen)
     print(f"[ok ] {idx.relative_to(survey_root)}")
     print(f"[ok ] {prof.relative_to(survey_root)}")
-    pv = plot_survey_planview(results, network, resumen, out_crs=out_crs)
+    pv = plot_survey_planview(results, network, resumen, out_crs=out_crs,
+                              args_labels=args)
     print(f"[ok ] {pv.relative_to(survey_root)}")
     lp = plot_long_profile(results, wsm, resumen, datum_name, network=network)
     if lp:
