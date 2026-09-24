@@ -2,12 +2,68 @@
 """
 process_adcp_bathimetric.py
 ================================================================================
-ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.1)
+ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.5)
 
 Builds a hydraulically consistent 1D bathymetric cross-section perpendicular
 to the mean flow, from a SonTek M9/S5 .mat file (RiverSurveyor Live export).
 
 Velocities are NOT exported. Only the bed profile and supporting QA artifacts.
+
+Changes in 6.5:
+    * BEAM NUMBERING. v3 to v6.4 placed beam 2 to STARBOARD; on the M9 it is
+      to PORT. The RSL manual defines XYZ right-handed with +X toward beam 1
+      and +Z up, every transformation matrix of campaign 2026-04-15 (64 files,
+      both frequency sets) puts beam 2 at +90 deg of beam 1 in that frame, and
+      the slant depths fit the VB profile better with that layout in 63 of 64
+      files (median RMS 0.084 against 0.150 m). Beams 1/3 of the 3 MHz set were
+      right; 2/4, and all four of the 1 MHz set, were mirrored across the
+      bow-stern line: up to 2*depth*tan(25 deg) off in the beam clouds, the
+      recorridos and the composite fill. beam-layout = auto reads the
+      handedness from each file's matrix; 'cw' reproduces v6.4 byte for byte.
+    * ATTITUDE. Pitch and roll signs are separate keys (pitch-sign bow-up |
+      bow-down, roll-sign stbd-down | port-down); antenna-height moves the
+      GNSS antenna to the transducer along the tilted mast; gnss-lag moves
+      each position lag x velocity forward. pitch-roll stays off by default;
+      tools/diagnostico_mat.py estimates sign, antenna height and lag from
+      passes over the same section in opposite directions. The depths are not
+      touched: RSL already reports them vertical ("compensation for tilt").
+      With pitch-roll off a transect whose tilt moves the VB footprint more
+      than 0.20 m gets a [warn].
+    * Compass.Pitch / Roll given as NS x 3 (RSL manual) are read per sample;
+      6.4 flattened them to 3*NS and pitch-roll was then silently ignored.
+
+Changes in 6.4:
+    * BED FIT (bed-fit = loess, default). The bed is a robust local-linear
+      regression of the PRIMARY points (tricube kernel, half-width 0.75 m
+      independent of dx, widened only to hold 3 points; LOWESS bisquare
+      weights only where a window has >= 5 points), QRev composite fill,
+      interpolation of what is left. v6.3's weighted median ignored where a
+      point sits in its window (uneven boat speed moved the bed sideways), its
+      window and the Savitzky-Golay were tied to dx (dx = 1 m: ~8 m of
+      smoothing) and the SG ran across the forced bank zeros, overshooting
+      where the measured bed meets the ramp. On synthetic crossings at dx = 1 m
+      the share of VB points more than 10 cm from the bed went 13-20 % -> 0-1 %.
+      bed-fit = median keeps build_profile() byte for byte.
+    * EXACT BANKS. Nodes at the ends of the measured bed and at both shores;
+      v6.3 snapped the right shore to a multiple of dx (whole-metre widths at
+      dx = 1). Ramp nodes are source code 5 (SRC_EDGE).
+    * BANK SHAPE from RSL (edge-shape = auto): Setup.Edges_0/1__Method, 2
+      triangular / 1 rectangular (QRev's SonTek reader); a rectangular bank
+      holds the end depth to the shore and closes with a vertical wall.
+    * PITCH / ROLL in the footprint geometry (pitch-roll = on | inv), every
+      beam tilted by R = Rz(heading) Ry(pitch) Rx(roll). Off by default: the
+      M9 sign is undocumented, a wrong sign doubles the footprint error, and
+      the effect is small (synthetic, tilt p95 3.9 deg at 1.3 m: bed RMS
+      0.021 -> 0.018 m with the right sign, 0.026 m with the wrong one).
+      tools/diagnostico_mat.py reports the attitude and, when RSL left the
+      slant depths uncorrected, the sign.
+    * CROSS-SECTION FIGURE: measured bed solid, extrapolated banks dashed,
+      interpolated gaps dotted; the legend names the primary reference.
+    * STATIONS on survey_plan_view.png (filled = gauge read in this campaign,
+      hollow = not read), clipped to the view, labels placed with the chainage
+      labels. The registry is built even without a readings file.
+    * survey_index.csv gains forma_mi, forma_md and bed_fit (appended).
+    6.2 and 6.3: see docs/CAMBIOS_v6.2.md and docs/CAMBIOS_v6.3.md.
 
 Changes in 6.1 (bug-fix release; numeric core untouched — build_profile,
 build_beam_cloud, flow direction and depth filters are identical to 6.0):
@@ -257,7 +313,7 @@ except Exception as e:
 DATUM_NAME_DEFAULT = "IGN SRVN16"
 
 # Script version (reported in logs and the traceability record).
-__version__ = "6.3"
+__version__ = "6.5"
 
 # 6.1: water-surface extrapolation beyond the last value of a path (slope
 # continuation) is reported as a WARNING only past this distance [m]; shorter
@@ -341,6 +397,78 @@ def get_field(struct, name, default=None):
     return default
 
 
+def _per_sample(v, n):
+    """6.5: one value per sample. The RSL manual lists Compass.Pitch / Roll as
+    NS x 3; a 2-D array keeps its first column (the sample value) instead of
+    being flattened to 3*NS, which silently disabled pitch-roll in 6.4."""
+    a = np.asarray(v, dtype=float)
+    if a.ndim == 2:
+        if a.shape[0] == n:
+            a = a[:, 0]
+        elif a.shape[1] == n:
+            a = a[0, :]
+    a = a.ravel()
+    if a.size != n:
+        return np.full(n, np.nan)
+    return a
+
+
+def beam_layout_from_matrix(tm):
+    """6.5: handedness of the slant-beam numbering from the file's own
+    Transformation_Matrices (4 x 4 x nfreq, beam -> XYZ).
+
+    RSL manual (Coordinate System Icons): XYZ is right-handed, +X toward beam 1,
+    +Z up; so +Y points to PORT. Row i of inv(T) is beam i's direction. If beam
+    2 sits at +90 deg (counter-clockwise seen from above) from beam 1, beam 2 is
+    to port: 'ccw'. The cross product (b1 x b2)_z decides it and is immune to
+    the global sign of the matrix. Returns (layout | None, note)."""
+    M = get_field(tm, "Matrix")
+    if M is None:
+        return None, "sin Transformation_Matrices"
+    try:
+        M = np.asarray(M, dtype=float)
+        if M.ndim == 2:
+            M = M[:, :, None]
+        elif M.ndim == 3 and M.shape[0] != 4 and M.shape[-1] == 4:
+            M = np.transpose(M, (1, 2, 0))
+        votes = []
+        for k in range(M.shape[2]):
+            T = M[:, :, k]
+            if T.shape != (4, 4) or not np.all(np.isfinite(T)) \
+                    or abs(np.linalg.det(T)) < 1e-9:
+                continue
+            B = np.linalg.inv(T)[:, :3]
+            nrm = np.linalg.norm(B, axis=1)
+            if np.any(nrm < 1e-9):
+                continue
+            incl = np.degrees(np.arccos(np.clip(np.abs(B[:, 2]) / nrm, 0, 1)))
+            if not np.all((incl > 15) & (incl < 35)):   # not a 25-deg Janus set
+                continue                                # (e.g. the vertical beam)
+            z = float(B[0, 0] * B[1, 1] - B[0, 1] * B[1, 0])
+            if abs(z) > 1e-6:
+                votes.append("ccw" if z > 0 else "cw")
+        if not votes:
+            return None, "matriz no invertible"
+        if len(set(votes)) > 1:
+            return None, f"matrices contradictorias ({', '.join(votes)})"
+        return votes[0], f"Transformation_Matrices ({len(votes)} frecuencias)"
+    except Exception as e:                              # never fatal
+        return None, f"matriz ilegible ({e})"
+
+
+def _opt_scalar(v):
+    """6.4: a Setup scalar as float, or None when absent / empty / NaN."""
+    if v is None:
+        return None
+    try:
+        a = np.asarray(v, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return None
+    if a.size == 0 or not np.isfinite(a[0]):
+        return None
+    return float(a[0])
+
+
 # ============================================================================ #
 #  STEP 1 — data extraction
 # ============================================================================ #
@@ -375,8 +503,21 @@ def extract_data(mat: dict) -> dict:
                   default=get_field(sysd, "Heading")),
         dtype=float,
     )
-    pitch      = np.asarray(get_field(comp, "Pitch", default=np.zeros_like(heading)), dtype=float)
-    roll       = np.asarray(get_field(comp, "Roll",  default=np.zeros_like(heading)), dtype=float)
+    # 6.4: attitude as QRev reads it — Compass.Pitch/Roll, else System.Pitch/Roll.
+    # Only the footprint geometry uses it, and only with --pitch-roll on/inv.
+    pitch = get_field(comp, "Pitch")
+    roll = get_field(comp, "Roll")
+    attitude_src = "Compass"
+    if pitch is None or roll is None:
+        pitch, roll = get_field(sysd, "Pitch"), get_field(sysd, "Roll")
+        attitude_src = "System"
+    if pitch is None or roll is None:
+        pitch, roll = np.zeros_like(heading), np.zeros_like(heading)
+        attitude_src = "none"
+    pitch      = _per_sample(pitch, len(vb_depth))
+    roll       = _per_sample(roll, len(vb_depth))
+    # 6.5: beam layout declared by the instrument's own transformation matrix
+    beam_layout, layout_note = beam_layout_from_matrix(mat.get("Transformation_Matrices"))
 
     time       = np.asarray(get_field(sysd, "Time", default=np.arange(len(vb_depth))), dtype=float)
 
@@ -414,6 +555,10 @@ def extract_data(mat: dict) -> dict:
     edge_right = float(get_field(setp, "Edges_1__DistanceToBank", default=0.0) or 0.0)
     _se        = get_field(setp, "startEdge", default=1)
     start_edge = int(_se) if _se is not None else 1   # 0 = Left, 1 = Right
+    # 6.4: bank shape the operator declared in RSL. Codes as in QRev's SonTek
+    # reader (TransectData.sontek): 2 triangular, 1 rectangular, 0 user Q.
+    edge_method_left = _opt_scalar(get_field(setp, "Edges_0__Method"))
+    edge_method_right = _opt_scalar(get_field(setp, "Edges_1__Method"))
 
     # v6: transducer draft. VERIFIED against QRev (Classes/DepthData.py): the
     # depths stored in the SonTek .mat ALREADY INCLUDE the draft — QRev keeps
@@ -437,10 +582,12 @@ def extract_data(mat: dict) -> dict:
         summary_depth=summary_depth,
         utm=utm,
         lat=lat, lon=lon, n_nofix=int(n_nofix),
-        heading=heading, pitch=pitch, roll=roll,
+        heading=heading, pitch=pitch, roll=roll, attitude_src=attitude_src,
+        beam_layout=beam_layout, beam_layout_note=layout_note,
         time=time, step=step,
         mean_vel=mean_vel,
         edge_left=edge_left, edge_right=edge_right, start_edge=start_edge,
+        edge_method_left=edge_method_left, edge_method_right=edge_method_right,
         sensor_depth=sensor_depth, depth_reference=depth_reference,
     )
 
@@ -1345,10 +1492,128 @@ def filter_cloud_depths(data: dict, enabled: bool = True,
 #  STEP 3 — beam footprints
 # ============================================================================ #
 
-# SonTek M9 azimuth sets (instrument frame, deg from FORWARD, CW)
-AZ_3000 = np.array([0.0, 90.0, 180.0, 270.0])     # F, S, A, P
-AZ_1000 = np.array([45.0, 135.0, 225.0, 315.0])   # FS, AS, AP, FP
+# Slant-beam azimuths, instrument frame, deg from FORWARD (beam 1), CLOCKWISE
+# seen from above — the convention of the footprint code below.
+#
+# 6.5: v3 to v6.4 assumed beam 2 to STARBOARD ('cw'). It is to PORT: the RSL
+# manual defines XYZ right-handed with +X toward beam 1 and +Z up (so +Y is
+# port), and every one of the 64 transformation matrices of campaign
+# 2026-04-15 puts beam 2 at +90 deg of beam 1 in that frame, in both frequency
+# sets. The data agree on their own: with 'ccw' the slant depths fit the VB
+# profile at their footprints better in 63 of 64 files (median RMS 0.084 m
+# against 0.150 m with 'cw'). Beams 1 and 3 were right; 2 and 4 of the 3 MHz
+# set and all four of the 1 MHz set were mirrored across the bow-stern line.
+BEAM_LAYOUTS = {
+    "ccw": {"3000": np.array([0.0, 270.0, 180.0, 90.0]),     # F, P, A, S
+            "1000": np.array([315.0, 225.0, 135.0, 45.0])},  # FP, AP, AS, FS
+    "cw":  {"3000": np.array([0.0, 90.0, 180.0, 270.0]),     # v3-v6.4 (mirrored)
+            "1000": np.array([45.0, 135.0, 225.0, 315.0])},
+}
+BEAM_LAYOUT_DEFAULT = "ccw"
+AZ_3000 = BEAM_LAYOUTS[BEAM_LAYOUT_DEFAULT]["3000"]
+AZ_1000 = BEAM_LAYOUTS[BEAM_LAYOUT_DEFAULT]["1000"]
 TILT_DEG = 25.0
+
+# 6.5: attitude. The RSL manual only says pitch is a rotation about the M9
+# y-axis and roll about the x-axis; the sign is not documented. The two signs
+# are therefore separate keys (pitch-sign, roll-sign), meaning what a POSITIVE
+# value does to the boat; tools/diagnostico_mat.py estimates them from passes
+# over the same section in opposite directions. RSL depths (VB and slant) are
+# already vertical, "including ... compensation for tilt" (RSL manual,
+# BottomTrack structure), so only the footprint POSITION needs the attitude.
+PITCH_SIGNS = {"bow-up": 1.0, "bow-down": -1.0}
+ROLL_SIGNS = {"stbd-down": 1.0, "port-down": -1.0, "none": 0.0}   # none: pitch only
+
+
+def attitude_signs(args):
+    """(pitch_sign, roll_sign) for build_beam_cloud, or None with pitch-roll off.
+    'inv' (6.4 spelling) flips both keys."""
+    mode = str(getattr(args, "pitch_roll", "off") or "off").lower()
+    if mode == "off":
+        return None
+    ps = PITCH_SIGNS[str(getattr(args, "pitch_sign", "bow-up"))]
+    rs = ROLL_SIGNS[str(getattr(args, "roll_sign", "stbd-down"))]
+    return (-ps, -rs) if mode == "inv" else (ps, rs)
+
+
+def apply_gnss_lag(utm, time, lag, log=None):
+    """6.5: a GNSS position reported `lag` seconds late belongs to where the
+    boat was `lag` s before; the boat is then `lag` x velocity further on.
+    Positive lag moves every ensemble forward along its own velocity."""
+    lag = float(lag or 0.0)
+    if not lag:
+        return utm
+    P = np.asarray(utm, dtype=float).copy()
+    t = np.asarray(time, dtype=float).ravel()
+    ok = np.isfinite(P).all(axis=1) & np.isfinite(t)
+    if ok.sum() < 3 or np.any(np.diff(t[ok]) <= 0):
+        if log is not None:
+            log.append("[warn] gnss-lag ignorado: System.Time no es creciente")
+        return utm
+    for j in (0, 1):
+        v = np.gradient(P[ok, j], t[ok])
+        P[ok, j] = P[ok, j] + v * lag
+    if log is not None:
+        sp = np.hypot(np.gradient(P[ok, 0], t[ok]), np.gradient(P[ok, 1], t[ok]))
+        log.append(f"[info] gnss-lag = {lag:+.2f} s: posiciones corridas "
+                   f"{np.median(sp) * abs(lag):.2f} m (mediana) a lo largo del recorrido")
+    return P
+
+
+def parse_antenna_offset(v):
+    """'fwd,stbd' [m] -> (fwd, stbd); None / '' / '0,0' -> None."""
+    if v is None or str(v).strip() == "":
+        return None
+    parts = [p for p in str(v).replace(";", ",").split(",") if p.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"antenna-offset: se esperan dos valores 'proa, estribor', no {v!r}")
+    fx, fy = float(parts[0]), float(parts[1])
+    return None if fx == 0.0 and fy == 0.0 else (fx, fy)
+
+
+def apply_antenna_offset(utm, heading, offset, log=None):
+    """6.5: move each GNSS position to the transducer, which sits `fwd` m
+    toward the bow and `stbd` m to starboard of the antenna (boat frame,
+    rotated by each ensemble's heading). RSL has the same setting
+    (Setup.offsetX / offsetY); use this one only when it was left at 0 in the
+    field. Level approximation: the tilt part is antenna-height."""
+    off = parse_antenna_offset(offset) if not isinstance(offset, tuple) else offset
+    if off is None:
+        return utm
+    fx, fy = off
+    P = np.asarray(utm, dtype=float).copy()
+    h = np.radians(np.asarray(heading, dtype=float).ravel())
+    if h.size != P.shape[0]:
+        if log is not None:
+            log.append("[warn] antenna-offset ignorado: rumbo y posiciones de distinto largo")
+        return utm
+    h = np.where(np.isfinite(h), h, 0.0)
+    P[:, 0] = P[:, 0] + fx * np.sin(h) + fy * np.cos(h)
+    P[:, 1] = P[:, 1] + fx * np.cos(h) - fy * np.sin(h)
+    if log is not None:
+        log.append(f"[info] antenna-offset: transductor {fx:+.2f} m hacia proa, "
+                   f"{fy:+.2f} m hacia estribor de la antena")
+    return P
+
+
+def resolve_beam_layout(data, args, log=None):
+    """6.5: beam-layout auto -> the file's matrix, else the documented M9
+    layout (ccw). An explicit value wins; 'cw' only reproduces v6.4."""
+    want = str(getattr(args, "beam_layout", "auto") or "auto").lower()
+    if want in BEAM_LAYOUTS:
+        lay, why = want, "forzada"
+    else:
+        lay = data.get("beam_layout")
+        why = data.get("beam_layout_note", "")
+        if lay not in BEAM_LAYOUTS:
+            lay, why = BEAM_LAYOUT_DEFAULT, f"por defecto ({why or 'sin matriz'})"
+    if log is not None:
+        side = "babor" if lay == "ccw" else "ESTRIBOR (regla v6.4)"
+        log.append(f"[info] numeración de haces: {lay}, haz 2 a {side} [{why}]")
+        if data.get("beam_layout") in BEAM_LAYOUTS and lay != data.get("beam_layout"):
+            log.append(f"[warn] beam-layout = {lay} contradice la matriz del archivo "
+                       f"({data.get('beam_layout')})")
+    return lay
 
 # Nominal frequencies [kHz] — used for the plan-view frequency colouring
 FREQ_VB   = 500.0     # vertical beam (nadir)
@@ -1372,6 +1637,8 @@ SRC_BT = 1        # bottom-track (slant) beams
 SRC_VB = 2        # vertical beam (nadir)
 SRC_DS = 3        # depth sounder (not present in these exports)
 SRC_INT = 4       # interpolated / gap-filled
+SRC_EDGE = 5      # 6.4: bank ramp or wall node — extrapolated to the shore,
+                  # not measured (not a QRev code)
 BEAM_BT_ENS = -1  # beam_index of a collapsed ensemble-averaged BT point
 BEAM_DS     = -2  # beam_index of a depth-sounder point
 
@@ -1393,11 +1660,27 @@ def beam_weight(az_deg: float, freq_khz: float) -> float:
     return W_SLANT
 
 
+def _attitude_rotation(hdg_deg, pitch_deg, roll_deg):
+    """6.4: body (forward, starboard, down) -> earth (north, east, down),
+    R = Rz(heading) . Ry(pitch) . Rx(roll), aerospace convention: pitch +
+    raises the bow, roll + lowers starboard."""
+    ps, cs = math.sin(math.radians(hdg_deg)), math.cos(math.radians(hdg_deg))
+    pt, ct = math.sin(math.radians(pitch_deg)), math.cos(math.radians(pitch_deg))
+    pr, cr = math.sin(math.radians(roll_deg)), math.cos(math.radians(roll_deg))
+    return np.array([
+        [cs * ct, cs * pt * pr - ps * cr, cs * pt * cr + ps * pr],
+        [ps * ct, ps * pt * pr + cs * cr, ps * pt * cr - cs * pr],
+        [-pt,     ct * pr,                ct * cr],
+    ])
+
+
 def build_beam_cloud(data: dict, utm: np.ndarray,
                      depth_ref: str = "vb",
                      bt_geometry: str = "footprints",
                      bt_avg: str = "idw",
-                     density_weighting: bool = True) -> dict:
+                     density_weighting: bool = True,
+                     pitch_roll=None, beam_layout: str = BEAM_LAYOUT_DEFAULT,
+                     antenna_height: float = 0.0) -> dict:
     """
     For every sample (ensemble), generate the VB footprint and the 4 active
     slant-beam footprints in (E, N, depth) using vessel heading.
@@ -1408,6 +1691,14 @@ def build_beam_cloud(data: dict, utm: np.ndarray,
           here — it is the unit of bottom-detection output.
         * PING = one individual acoustic shot. System.Pings stores how many
           pings were averaged into each sample (typically 7–35 in this data).
+
+    6.4 / 6.5 — `pitch_roll` = (pitch_sign, roll_sign) from attitude_signs()
+    tilts every beam, the vertical one included, by the ensemble's pitch and
+    roll before locating its footprint; None is the level geometry of v6.3.
+    The depths are vertical already (RSL compensates them for tilt). With the
+    attitude on, the GNSS antenna `antenna_height` metres above the transducer
+    is also moved to the transducer: a mast leans with the boat.
+    `beam_layout` picks the azimuth set (BEAM_LAYOUTS).
 
     Returns columns of equal length, one entry per (sample, beam) pair.
     """
@@ -1449,6 +1740,31 @@ def build_beam_cloud(data: dict, utm: np.ndarray,
 
     tilt = math.radians(TILT_DEG)
 
+    if isinstance(pitch_roll, str):                       # 6.4 call sites
+        pitch_roll = {"on": (1.0, 1.0), "inv": (-1.0, -1.0)}.get(pitch_roll.lower())
+    signs = pitch_roll
+    lay = BEAM_LAYOUTS.get(str(beam_layout or BEAM_LAYOUT_DEFAULT).lower(),
+                           BEAM_LAYOUTS[BEAM_LAYOUT_DEFAULT])
+    ant_h = float(antenna_height or 0.0)
+    if signs is not None:
+        pitch = np.asarray(data.get("pitch", np.zeros(n)), dtype=float).ravel()
+        roll = np.asarray(data.get("roll", np.zeros(n)), dtype=float).ravel()
+        if pitch.size != n or roll.size != n:
+            signs = None
+    st, ct = math.sin(tilt), math.cos(tilt)
+
+    def _offset(rot, az_deg, depth, slant=True):
+        """Horizontal footprint offset (dE, dN) of a tilted beam."""
+        if slant:
+            a = math.radians(az_deg)
+            b = np.array([st * math.cos(a), st * math.sin(a), ct])
+        else:
+            b = np.array([0.0, 0.0, 1.0])
+        v = rot @ b                               # north, east, down
+        if v[2] < 0.2:                            # > 78 deg from vertical: bogus
+            return None
+        return depth * v[1] / v[2], depth * v[0] / v[2]
+
     for i in range(n):                         # loop over SAMPLES
         E0, N0 = utm[i]
         if not (np.isfinite(E0) and np.isfinite(N0)):
@@ -1456,10 +1772,24 @@ def build_beam_cloud(data: dict, utm: np.ndarray,
         hdg = heading[i] if np.isfinite(heading[i]) else 0.0
         hdg_rad = math.radians(hdg)            # ADP +CW from true north
         wd = float(w_den[i]) if np.isfinite(w_den[i]) else 1.0
+        rot = None
+        if signs is not None:
+            p_i = pitch[i] if np.isfinite(pitch[i]) else 0.0
+            r_i = roll[i] if np.isfinite(roll[i]) else 0.0
+            rot = _attitude_rotation(hdg, signs[0] * p_i, signs[1] * r_i)
+            if ant_h:                          # antenna -> transducer lever arm
+                N0 = N0 + ant_h * rot[0, 2]
+                E0 = E0 + ant_h * rot[1, 2]
 
         # --- vertical beam ---
         if np.isfinite(vb_depth[i]) and vb_depth[i] > 0:
-            pts_e.append(E0); pts_n.append(N0); pts_z.append(float(vb_depth[i]))
+            ev, nv = E0, N0
+            if rot is not None:
+                off = _offset(rot, 0.0, float(vb_depth[i]), slant=False)
+                if off is None:
+                    off = (0.0, 0.0)
+                ev, nv = E0 + off[0], N0 + off[1]
+            pts_e.append(ev); pts_n.append(nv); pts_z.append(float(vb_depth[i]))
             pts_w.append(W_VB * wd); pts_b.append(0); pts_f.append(FREQ_VB)
             pts_ens.append(i); pts_src.append(SRC_VB)
             pts_pri.append(depth_ref == "vb")
@@ -1477,18 +1807,24 @@ def build_beam_cloud(data: dict, utm: np.ndarray,
                 pts_pri.append(depth_ref == "bt")
         else:
             # --- 4 slant beams at their real footprints ---
-            az_set = AZ_3000 if f >= FREQ_SPLIT else AZ_1000
+            az_set = lay["3000"] if f >= FREQ_SPLIT else lay["1000"]
             for k in range(4):
                 d = bt_beams[i, k]
                 if not np.isfinite(d) or d <= 0:
                     continue
-                az_inst = math.radians(az_set[k])     # instrument frame, +CW from forward
-                # World azimuth (true north, +CW) = heading + instrument azimuth
-                az_world = hdg_rad + az_inst
-                r = d * math.tan(tilt)                # horizontal radius of footprint
-                # Compass azimuth (CW from N): dE = r*sin(az), dN = r*cos(az)
-                dE = r * math.sin(az_world)
-                dN = r * math.cos(az_world)
+                if rot is not None:
+                    off = _offset(rot, az_set[k], float(d))
+                    if off is None:
+                        continue
+                    dE, dN = off
+                else:
+                    az_inst = math.radians(az_set[k])  # instrument frame, +CW from forward
+                    # World azimuth (true north, +CW) = heading + instrument azimuth
+                    az_world = hdg_rad + az_inst
+                    r = d * math.tan(tilt)             # horizontal radius of footprint
+                    # Compass azimuth (CW from N): dE = r*sin(az), dN = r*cos(az)
+                    dE = r * math.sin(az_world)
+                    dN = r * math.cos(az_world)
                 pts_e.append(E0 + dE)
                 pts_n.append(N0 + dN)
                 pts_z.append(float(d))
@@ -3632,6 +3968,296 @@ def build_profile(
 
 
 # ============================================================================ #
+#  STEP 5b — 6.4 bed fit: robust local-linear regression (bed-fit = loess)
+# ============================================================================ #
+
+BED_HALFWIDTH_DEFAULT = 0.75   # [m] base half-width of the kernel
+BED_WIDEN_FACTOR = 2.0         # the half-width may grow to this x the base ...
+BED_KNN = 3                    # ... to hold this many points (a line needs 3)
+BED_SPREAD_FRAC = 0.2          # min weighted spread of s in a window (x h) for a line
+BED_ROBUST_ITER = 2            # LOWESS bisquare iterations
+BED_ROBUST_JUDGE = 5           # a point is judged only with >= this many neighbours
+BED_ROBUST_FLOOR = 0.20        # [m] minimum residual scale of the bisquare ...
+BED_ROBUST_FRAC = 0.075        # ... or this fraction of the depth, if larger
+WALL_EPS = 0.01                # [m] plan width of a vertical bank / zero edge
+EDGE_METHOD_SHAPE = {2: "triangular", 1: "rectangular"}   # 0 = user Q: no shape
+
+
+def _tricube(u):
+    u = np.minimum(np.abs(u), 1.0)
+    return (1.0 - u ** 3) ** 3
+
+
+class _BedPoints:
+    """Points of one depth source sorted by s, for window queries."""
+
+    def __init__(self, s, d, w):
+        o = np.argsort(s, kind="stable")
+        self.s = np.asarray(s, dtype=float)[o]
+        self.d = np.asarray(d, dtype=float)[o]
+        self.w = np.asarray(w, dtype=float)[o]
+        self.rob = np.ones(self.s.size)
+
+    @property
+    def n(self):
+        return int(self.s.size)
+
+    def bandwidth(self, x, h0, hmax):
+        """h0, widened up to hmax until the window holds BED_KNN points."""
+        if self.n == 0:
+            return h0
+        i = int(np.searchsorted(self.s, x))
+        near = np.sort(np.abs(self.s[max(0, i - BED_KNN): i + BED_KNN] - x))
+        k = min(BED_KNN, near.size)
+        return float(min(max(h0, near[k - 1]), hmax))
+
+    def fit(self, x, h, min_line):
+        """Weighted local-linear estimate at x; (value, n in window)."""
+        a = int(np.searchsorted(self.s, x - h, side="left"))
+        b = int(np.searchsorted(self.s, x + h, side="right"))
+        n = b - a
+        if n == 0:
+            return float("nan"), 0
+        ss, dd = self.s[a:b], self.d[a:b]
+        ww = self.w[a:b] * self.rob[a:b] * _tricube((ss - x) / (h * 1.0001))
+        sw = float(np.sum(ww))
+        if not sw > 0.0:
+            return float("nan"), n
+        mu = float(np.sum(ww * ss)) / sw
+        dm = float(np.sum(ww * dd)) / sw
+        var = float(np.sum(ww * (ss - mu) ** 2)) / sw
+        if n >= min_line and var >= (BED_SPREAD_FRAC * h) ** 2:
+            slope = float(np.sum(ww * (ss - mu) * (dd - dm))) / (sw * var)
+            return dm + slope * (x - mu), n
+        return dm, n
+
+
+def _min_line(x, lo, hi, h):
+    """Two points already define a line within a window of the ends of the
+    measured zone, where the window is one-sided and a weighted mean would be
+    biased toward the interior; elsewhere a line needs three."""
+    return 2 if (x - lo) < h or (hi - x) < h else BED_KNN
+
+
+def _bed_curve(pts, xs, h0, hmax, lo, hi, gate):
+    z = np.full(len(xs), np.nan)
+    hs = np.full(len(xs), np.nan)
+    for i, x in enumerate(xs):
+        h = pts.bandwidth(x, h0, hmax)
+        v, n = pts.fit(x, h, _min_line(x, lo, hi, h))
+        hs[i] = h
+        if n >= max(1, gate):
+            z[i] = v
+    return z, hs
+
+
+def _bed_robust(pts, h0, hmax, lo, hi):
+    """LOWESS bisquare weights. A point is only judged when its window holds
+    BED_ROBUST_JUDGE points: with two or three there is no telling a spike
+    from a sharp thalweg, and down-weighting would cut real bedforms (tested:
+    leave-one-out residuals took a thalweg 0.06 -> 0.35 m off)."""
+    if pts.n < BED_ROBUST_JUDGE:
+        return
+    for _ in range(BED_ROBUST_ITER):
+        fit, _hs = _bed_curve(pts, pts.s, h0, hmax, lo, hi, 1)
+        r = np.where(np.isfinite(fit), pts.d - fit, 0.0)
+        cnt = np.array([int(np.searchsorted(pts.s, x + h, side="right")
+                            - np.searchsorted(pts.s, x - h, side="left"))
+                        for x, h in zip(pts.s, _hs)])
+        judged = cnt >= BED_ROBUST_JUDGE
+        if not np.any(judged):
+            return
+        mad = float(np.median(np.abs(r[judged])))
+        scale = np.maximum(max(6.0 * mad, BED_ROBUST_FLOOR), BED_ROBUST_FRAC * pts.d)
+        u = np.minimum(np.abs(r) / scale, 1.0)
+        pts.rob = np.where(judged, (1.0 - u ** 2) ** 2, 1.0)
+
+
+def fit_bed_measured(s_pts, depth_pts, w_pts, primary, src, lo, hi, dx,
+                     h0=BED_HALFWIDTH_DEFAULT, primary_min=1, composite=True):
+    """6.4: the bed over the MEASURED zone [lo, hi] (s already shifted).
+
+    At each node a weighted local-linear regression (tricube kernel of
+    half-width h0, widened up to BED_WIDEN_FACTOR*h0 only to hold BED_KNN
+    points) on the PRIMARY points, with LOWESS robustness weights; nodes the
+    primary does not reach with `primary_min` points are filled from the
+    secondary points (QRev composite), the rest is interpolated.
+
+    Why not v6.3's weighted median + Savitzky-Golay: the median ignores WHERE
+    a point sits inside its window, so uneven boat speed (density weights)
+    moved the bed sideways; its window and the SG window were tied to dx, so
+    dx = 1 m smoothed over 4 m + 4 m; and the SG ran across the forced zeros
+    of the banks, overshooting where the measured bed meets the ramp.
+
+    Nodes: every multiple of dx inside (lo, hi) plus lo and hi exactly.
+    Returns (nodes, depth, src_code, info) or None without any usable point."""
+    s_pts = np.asarray(s_pts, dtype=float)
+    d = np.asarray(depth_pts, dtype=float)
+    w = np.asarray(w_pts, dtype=float)
+    src = np.asarray(src, dtype=int) if src is not None else np.full(d.size, SRC_VB)
+    pri = (np.ones(d.size, dtype=bool) if primary is None
+           else np.asarray(primary, dtype=bool))
+    ok = np.isfinite(s_pts) & np.isfinite(d) & (d > 0) & np.isfinite(w) & (w > 0)
+    if not np.any(ok):
+        return None
+    hmax = BED_WIDEN_FACTOR * h0
+    k0, k1 = math.ceil(lo / dx - 1e-9), math.floor(hi / dx + 1e-9)
+    grid = np.arange(k0, k1 + 1) * dx
+    grid = grid[(grid > lo + 0.05 * dx) & (grid < hi - 0.05 * dx)]
+    nodes = np.unique(np.concatenate([[lo], grid, [hi]]))
+
+    def _code(mask, default):
+        return int(np.bincount(src[mask]).argmax()) if np.any(mask) else default
+
+    z = np.full(nodes.size, np.nan)
+    code = np.full(nodes.size, float(SRC_INT))
+    info = dict(n_pri=0, n_sec=0, n_int=0, h_med=float("nan"))
+    mp = ok & pri
+    if np.any(mp):
+        P = _BedPoints(s_pts[mp], d[mp], w[mp])
+        _bed_robust(P, h0, hmax, lo, hi)
+        zp, hs = _bed_curve(P, nodes, h0, hmax, lo, hi, primary_min)
+        z = zp
+        code[np.isfinite(z)] = _code(mp, SRC_VB)
+        info["h_med"] = float(np.nanmedian(hs))
+        info["n_down"] = int(np.count_nonzero(P.rob < 0.5))
+    need = ~np.isfinite(z)
+    ms = ok & ~pri
+    if composite and np.any(need) and np.any(ms):
+        a, b = float(nodes[need].min()) - 2 * hmax, float(nodes[need].max()) + 2 * hmax
+        ms = ms & (s_pts >= a) & (s_pts <= b)
+        if np.any(ms):
+            S = _BedPoints(s_pts[ms], d[ms], w[ms])
+            _bed_robust(S, h0, hmax, lo, hi)
+            zs, _hs = _bed_curve(S, nodes[need], h0, hmax, lo, hi, 1)
+            z[need] = zs
+            code[np.where(need)[0][np.isfinite(zs)]] = _code(ms, SRC_BT)
+    fin = np.isfinite(z)
+    if not np.any(fin):
+        return None
+    if not np.all(fin):
+        z[~fin] = np.interp(nodes[~fin], nodes[fin], z[fin])
+    z = np.clip(z, 0.0, None)
+    info["n_pri"] = int(np.count_nonzero(code == _code(mp, SRC_VB))) if np.any(mp) else 0
+    info["n_int"] = int(np.count_nonzero(~fin))
+    info["n_sec"] = int(nodes.size - info["n_pri"] - info["n_int"])
+    return nodes, z, code, info
+
+
+def assemble_bank_profile(nodes, z, code, lo, hi, s_bank, dx,
+                          shape_l="triangular", shape_r="triangular"):
+    """6.4: measured zone + banks. Left bank at s = 0, right bank at s_bank,
+    both EXACT (v6.3 snapped the right bank to a multiple of dx, so widths came
+    out as whole metres at dx = 1).
+
+      triangular  : straight ramp from the end of the measured bed to depth 0
+                    at the shore (v6.3 behaviour);
+      rectangular : the end depth is held to the shore, then a vertical wall
+                    (WALL_EPS wide, so s stays strictly increasing).
+    Ramp nodes also fall on multiples of dx. Every bank node is SRC_EDGE."""
+    def _grid(a, b):
+        g = np.arange(math.ceil(a / dx - 1e-9), math.floor(b / dx + 1e-9) + 1) * dx
+        return g[(g > a + 0.05 * dx) & (g < b - 0.05 * dx)]
+
+    z_lo, z_hi = float(z[0]), float(z[-1])
+    gl = _grid(0.0, lo)
+    if shape_l == "rectangular" and lo > WALL_EPS + 1e-9:
+        gl = gl[gl > WALL_EPS + 1e-9]
+        sl = np.concatenate([[0.0, WALL_EPS], gl])
+        dl = np.concatenate([[0.0], np.full(sl.size - 1, z_lo)])
+    else:
+        sl = np.concatenate([[0.0], gl])
+        dl = z_lo * sl / lo if lo > 0 else np.zeros(sl.size)
+    gr = _grid(hi, s_bank)
+    if shape_r == "rectangular" and s_bank - hi > WALL_EPS + 1e-9:
+        gr = gr[gr < s_bank - WALL_EPS - 1e-9]
+        sr = np.concatenate([gr, [s_bank - WALL_EPS, s_bank]])
+        dr = np.concatenate([np.full(sr.size - 1, z_hi), [0.0]])
+    else:
+        sr = np.concatenate([gr, [s_bank]])
+        dr = (z_hi * (s_bank - sr) / (s_bank - hi) if s_bank > hi
+              else np.zeros(sr.size))
+    s_grid = np.concatenate([sl, nodes, sr])
+    depth = np.concatenate([dl, z, dr])
+    src = np.concatenate([np.full(sl.size, float(SRC_EDGE)), code,
+                          np.full(sr.size, float(SRC_EDGE))])
+    if s_grid.size > 1 and np.any(np.diff(s_grid) <= 0):      # safety net
+        keep = np.concatenate([[True], np.diff(s_grid) > 1e-9])
+        s_grid, depth, src = s_grid[keep], depth[keep], src[keep]
+    return s_grid, depth, src
+
+
+def build_profile_loess(s_pts, depth_pts, w_pts, ref_extent, edge_left_dist,
+                        edge_right_dist, dx, h0=None, primary=None, src=None,
+                        composite=True, primary_min=1,
+                        shape_l="triangular", shape_r="triangular"):
+    """6.4 counterpart of build_profile() (bed-fit = loess). Same frame: the
+    measured zone starts at s = edge_left_dist, the left bank is s = 0.
+    A zero edge distance becomes a WALL_EPS-wide vertical bank.
+    Returns (s_grid, depth_grid, shift, src_grid, meta)."""
+    h0 = BED_HALFWIDTH_DEFAULT if h0 is None else float(h0)
+    s_pts = np.asarray(s_pts, dtype=float)
+    lo_raw, hi_raw = (ref_extent if ref_extent is not None
+                      else (float("nan"), float("nan")))
+    if not (np.isfinite(lo_raw) and np.isfinite(hi_raw)) or hi_raw < lo_raw:
+        fin = np.isfinite(s_pts) & np.isfinite(np.asarray(depth_pts, dtype=float))
+        lo_raw, hi_raw = float(np.min(s_pts[fin])), float(np.max(s_pts[fin]))
+    edge_l = max(float(edge_left_dist or 0.0), WALL_EPS)
+    edge_r = max(float(edge_right_dist or 0.0), WALL_EPS)
+    shift = edge_l - lo_raw
+    lo, hi = edge_l, hi_raw + shift
+    res = fit_bed_measured(s_pts + shift, depth_pts, w_pts, primary, src, lo, hi,
+                           dx, h0=h0, primary_min=primary_min, composite=composite)
+    if res is None:
+        raise ValueError("no valid bed point to fit")
+    nodes, z, code, info = res
+    s_bank = hi + edge_r
+    s_grid, depth_grid, src_grid = assemble_bank_profile(
+        nodes, z, code, lo, hi, s_bank, dx, shape_l, shape_r)
+    meta = dict(lo=lo, hi=hi, s_bank=s_bank, h0=h0, shape_l=shape_l,
+                shape_r=shape_r, **info)
+    return s_grid, depth_grid, shift, src_grid, meta
+
+
+def resolve_edge_shapes(methods_l, methods_r, mode="auto", log=None, bed_fit="loess"):
+    """6.4: bank shape per side. `methods_*` are the Edges_*__Method codes of
+    one transect, or of every repetition of an aforo (majority wins; a tie is
+    triangular). mode 'triangular' / 'rectangular' forces both banks."""
+    mode = str(mode or "auto").lower()
+
+    def _one(codes, side):
+        if mode in ("triangular", "rectangular"):
+            return mode, "forzada"
+        vals = [EDGE_METHOD_SHAPE.get(int(round(c))) for c in codes if c is not None]
+        known = [v for v in vals if v]
+        if not known:
+            why = ("Q de usuario en RSL" if any(c is not None for c in codes)
+                   else "sin Edges_*__Method")
+            return "triangular", why
+        tri, rect = known.count("triangular"), known.count("rectangular")
+        if rect > tri:
+            return "rectangular", "RSL"
+        if rect and rect == tri and log is not None:
+            log.append(f"[warn] margen {side}: las repeticiones declaran formas "
+                       "distintas (empate) — se usa triangular")
+        return "triangular", "RSL"
+
+    (sl, wl), (sr, wr) = _one(methods_l, "izquierda"), _one(methods_r, "derecha")
+    if bed_fit == "median" and "rectangular" in (sl, sr):
+        if log is not None:
+            log.append("[warn] forma de margen rectangular declarada, pero "
+                       "bed-fit = median sólo traza rampas: se usa triangular")
+        if sl == "rectangular":
+            sl, wl = "triangular", "bed-fit median"
+        if sr == "rectangular":
+            sr, wr = "triangular", "bed-fit median"
+    if log is not None:
+        log.append(f"[info] forma de margen: izquierda {sl} ({wl}), "
+                   f"derecha {sr} ({wr})")
+    return sl, sr
+
+
+# ============================================================================ #
 #  STEP 6 — exports
 # ============================================================================ #
 
@@ -3814,13 +4440,37 @@ def plot_plan_view(outdir: Path, perfil_id: str, progresiva_m,
     return path
 
 
+def _bed_segments(s_grid, y, src_grid, lo, hi):
+    """6.4: split the bed line by what each segment is. Returns
+    {'measured'|'edge'|'interp': (x, y)} with NaN breaks between runs."""
+    out = {"measured": ([], []), "edge": ([], []), "interp": ([], [])}
+    last = None
+    for i in range(len(s_grid) - 1):
+        a, b = float(s_grid[i]), float(s_grid[i + 1])
+        if b <= lo + 1e-9 or a >= hi - 1e-9:
+            kind = "edge"
+        elif SRC_INT in (int(src_grid[i]), int(src_grid[i + 1])):
+            kind = "interp"
+        else:
+            kind = "measured"
+        xs, ys = out[kind]
+        if last != kind and xs:
+            xs.append(np.nan); ys.append(np.nan)
+        if last != kind or not xs:
+            xs.append(a); ys.append(float(y[i]))
+        xs.append(b); ys.append(float(y[i + 1]))
+        last = kind
+    return {k: (np.asarray(v[0]), np.asarray(v[1])) for k, v in out.items() if v[0]}
+
+
 def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
                         s_pts: np.ndarray, depth_pts: np.ndarray,
                         beam_idx: np.ndarray,
                         s_grid: np.ndarray, depth_grid: np.ndarray,
                         brazo: str = "", ws_elev=None,
                         datum_name: str = DATUM_NAME_DEFAULT,
-                        river: str = ""):
+                        river: str = "", src_grid=None, bed_meta=None,
+                        depth_ref: str = "vb"):
     """Cross-section: beam cloud + smoothed bed.
 
     If `ws_elev` is given, the vertical axis is ABSOLUTE elevation in the datum
@@ -3832,6 +4482,11 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
     bed fill, which is what made the figure unreadable on narrow sections. The
     bank labels now sit above the axes, the legend below them, and the numbers
     that used to be buried in the log are on the subtitle line.
+
+    6.4 (bed-fit = loess, i.e. `bed_meta` given): the bed is drawn solid only
+    where it was measured; the bank ramps / walls, which are extrapolated to
+    the shore, are dashed, and gaps bridged by interpolation are dotted. The
+    legend names the primary depth reference.
     (All on-plot text in Spanish.)"""
     fig, ax = plt.subplots(figsize=(11, 5.4))
 
@@ -3854,8 +4509,19 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
     if np.any(m_vb):
         ax.scatter(s_pts[m_vb], e0 - depth_pts[m_vb], s=9, c="#222222",
                    alpha=0.65, lw=0, zorder=3)
-    ax.plot(s_grid, y_bed, "-", color="#1a1a1a", lw=1.6, zorder=4,
-            solid_capstyle="round")
+    styled = bed_meta is not None and src_grid is not None \
+        and len(src_grid) == len(s_grid)
+    segs = (_bed_segments(s_grid, y_bed, src_grid, bed_meta["lo"], bed_meta["hi"])
+            if styled else {"measured": (s_grid, y_bed)})
+    if "measured" in segs:
+        ax.plot(*segs["measured"], "-", color="#1a1a1a", lw=1.6, zorder=4,
+                solid_capstyle="round")
+    if "edge" in segs:
+        ax.plot(*segs["edge"], color="#1a1a1a", lw=1.3, zorder=4,
+                ls=(0, (4.5, 2.5)), alpha=0.85)
+    if "interp" in segs:
+        ax.plot(*segs["interp"], color="#1a1a1a", lw=1.5, zorder=4,
+                ls=(0, (1.2, 1.8)))
     ax.axhline(y_surf, color="#1f3b73", lw=1.1, ls="--", alpha=0.8, zorder=4)
 
     # bank markers OUTSIDE the data area (x-axis transform, not data coords)
@@ -3896,20 +4562,41 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
         bits.append(f"pelo de agua {y_surf:.2f} m {datum_name}".replace(".", ","))
     else:
         bits.append("cotas RELATIVAS (sin pelo de agua)")
+    if styled:
+        rect = [lab for lab, key in (("MI", "shape_l"), ("MD", "shape_r"))
+                if bed_meta.get(key) == "rectangular"]
+        if rect:
+            bits.append("margen " + " y ".join(rect) + " vertical (RSL)")
     ax.set_title("   ·   ".join(bits), fontsize=8.8, color="0.35", loc="left", pad=22)
 
-    handles = [
-        Line2D([], [], color="#1a1a1a", lw=1.6, label="Lecho"),
+    ref_bt = str(depth_ref).lower() == "bt"
+    handles = [Line2D([], [], color="#1a1a1a", lw=1.6,
+                      label="Lecho medido" if styled else "Lecho")]
+    if "edge" in segs:
+        vert = bool(styled and "rectangular" in (bed_meta.get("shape_l"),
+                                                 bed_meta.get("shape_r")))
+        handles.append(Line2D([], [], color="#1a1a1a", lw=1.3, ls=(0, (4.5, 2.5)),
+                              label=("Margen extrapolada a la orilla" if vert
+                                     else "Rampa a la orilla (extrapolada)")))
+    if "interp" in segs:
+        handles.append(Line2D([], [], color="#1a1a1a", lw=1.5, ls=(0, (1.2, 1.8)),
+                              label="Tramo interpolado"))
+    handles += [
         Line2D([], [], color="#1f3b73", lw=1.1, ls="--", label="Pelo de agua"),
         Line2D([], [], marker="o", ls="", color="#222222", ms=4, alpha=0.7,
-               label="Haz vertical (VB)"),
+               label="Haz vertical (VB)" + ("" if ref_bt or not styled
+                                            else " · referencia")),
         Line2D([], [], marker="o", ls="", color="#5b7fa6", ms=4, alpha=0.5,
-               label="Haces laterales (BT)"),
+               label="Haces laterales (BT)" + (" · referencia" if ref_bt and styled
+                                               else "")),
     ]
+    ncol = len(handles) if len(handles) <= 4 else 3
+    rows = math.ceil(len(handles) / ncol)
     ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.135),
-              ncol=4, fontsize=8.5, frameon=False, handletextpad=0.5,
+              ncol=ncol, fontsize=8.5, frameon=False, handletextpad=0.5,
               columnspacing=2.2)
-    fig.subplots_adjust(left=0.075, right=0.985, top=0.845, bottom=0.185)
+    fig.subplots_adjust(left=0.075, right=0.985, top=0.845,
+                        bottom=0.185 + 0.04 * (rows - 1))
     path = outdir / "cross_section.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -4051,6 +4738,75 @@ def acceptance_tests(theta_flow: float, theta_section: float,
 #  PER-TRANSECT DRIVER
 # ============================================================================ #
 
+def bed_halfwidth(args):
+    """6.4: effective half-width of the bed fit. loess: a fixed length
+    (BED_HALFWIDTH_DEFAULT) independent of dx; median: 2*dx as in v6.3."""
+    if getattr(args, "bin_half_width", None) is not None:
+        return float(args.bin_half_width)
+    if str(getattr(args, "bed_fit", "loess")) == "median":
+        return 2.0 * float(args.dx)
+    return BED_HALFWIDTH_DEFAULT
+
+
+ATTITUDE_WARN_SHIFT = 0.20     # [m] 6.5: level-geometry error worth a [warn]
+
+
+def _attitude_log(data, args, log, depth_hint=None, theta_section=None):
+    """6.4: one line on the attitude of this transect. 6.5: written also with
+    pitch-roll off, as a warning when the tilt is large enough to matter."""
+    mode = str(getattr(args, "pitch_roll", "off") or "off")
+    p = np.asarray(data.get("pitch", []), dtype=float)
+    r = np.asarray(data.get("roll", []), dtype=float)
+    if p.size == 0 or data.get("attitude_src") == "none" or not np.any(np.isfinite(p)):
+        if mode != "off":
+            log.append(f"[warn] pitch-roll = {mode}, pero el .mat no trae pitch/roll: "
+                       "huellas niveladas")
+        return
+    with np.errstate(invalid="ignore"):
+        tilt = np.degrees(np.arccos(np.clip(np.cos(np.radians(p))
+                                            * np.cos(np.radians(r)), -1, 1)))
+    t95 = float(np.nanpercentile(tilt, 95)) if np.any(np.isfinite(tilt)) else float("nan")
+    d = float(depth_hint) if depth_hint is not None else float("nan")
+    shift = (d + float(getattr(args, "antenna_height", 0.0) or 0.0)) \
+        * math.tan(math.radians(t95)) if np.isfinite(d) and np.isfinite(t95) else float("nan")
+    # 6.5: how much of the pitch shift lies ALONG the section. The bow of a
+    # boat ferrying across points upstream, so most of it moves the footprint
+    # up/downstream, off the section line, where it barely changes the profile.
+    along = float("nan")
+    h = np.asarray(data.get("heading", []), dtype=float)
+    if theta_section is not None and h.size == p.size and np.any(np.isfinite(h)):
+        along = float(np.nanmedian(np.abs(np.sin(np.radians(h) + theta_section))))
+    if mode == "off":
+        if np.isfinite(shift) and shift > ATTITUDE_WARN_SHIFT:
+            msg = (f"[warn] actitud sin corregir (pitch-roll = off): inclinación p95 "
+                   f"{t95:.1f}°, pitch med {np.nanmedian(p):+.1f}° -> a {d:.1f} m la "
+                   f"huella del VB queda corrida hasta {shift:.2f} m")
+            if np.isfinite(along):
+                msg += (f", {shift * along:.2f} m a lo largo de la sección (proa a "
+                        f"{math.degrees(math.acos(min(1.0, along))):.0f}° del eje de la sección)")
+            log.append(msg if not np.isfinite(along) or shift * along > ATTITUDE_WARN_SHIFT
+                       else msg.replace("[warn]", "[info]", 1))
+        return
+    signs = attitude_signs(args)
+    roll_txt = ("no se aplica" if signs[1] == 0 else
+                "roll + = " + ("estribor abajo" if signs[1] > 0 else "babor abajo"))
+    msg = (f"[info] pitch-roll = {mode} ({data.get('attitude_src')}; pitch + = "
+           f"{'proa arriba' if signs[0] > 0 else 'proa abajo'}, {roll_txt}): inclinación "
+           f"p95 {t95:.1f}°, pitch med {np.nanmedian(p):+.1f}°, roll med "
+           f"{np.nanmedian(r):+.1f}°")
+    if np.isfinite(shift):
+        msg += f" -> a {d:.1f} m la huella del VB se corre hasta {shift:.2f} m"
+    log.append(msg)
+
+
+def _bed_source_log(src_grid, log):
+    counts = {k: int(np.count_nonzero(src_grid == k))
+              for k in (SRC_VB, SRC_BT, SRC_INT, SRC_EDGE)}
+    log.append(f"[info] bed source: {counts[SRC_VB]} nodes VB, {counts[SRC_BT]} nodes BT, "
+               f"{counts[SRC_INT]} nodes interpolated"
+               + (f", {counts[SRC_EDGE]} bank nodes" if counts[SRC_EDGE] else ""))
+
+
 def _manual_river(args, network, perfil_id, log=None):
     """River forced for a transect by the INI [rios] section (6.1), matched
     accent- and case-insensitively against the centerline river names."""
@@ -4168,6 +4924,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         Ex, Ny = tr.transform(data["lon"], data["lat"])
         utm = np.column_stack([Ex, Ny])
         log.append("[info] derived UTM from Lat/Lon")
+    utm = apply_gnss_lag(utm, data["time"], getattr(args, "gnss_lag", 0.0), log)
+    utm = apply_antenna_offset(utm, data["heading"], getattr(args, "antenna_offset", None), log)
 
     # --------------------------------------------------- v6 depth reference
     depth_ref, bt_geometry, composite_on = resolve_depth_reference(data, args, log)
@@ -4188,11 +4946,17 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
     theta_flow, theta_section = flow_direction_for(data, utm, args, log)
 
     # ------------------------------------------------------------ STEP 3
+    layout = resolve_beam_layout(data, args, log)
     cloud = build_beam_cloud(data, utm, depth_ref=depth_ref,
                              bt_geometry=bt_geometry, bt_avg=args.bt_avg,
-                             density_weighting=(args.density_weighting != "off"))
+                             density_weighting=(args.density_weighting != "off"),
+                             pitch_roll=attitude_signs(args), beam_layout=layout,
+                             antenna_height=args.antenna_height)
     log.append(f"[info] beam cloud points: {len(cloud['E'])} "
                f"({int(cloud['primary'].sum())} primary [{depth_ref}])")
+    _attitude_log(data, args, log, theta_section=theta_section,
+                  depth_hint=(np.nanmedian(data["vb_depth"])
+                              if np.any(np.isfinite(data["vb_depth"])) else None))
 
     # ------------------------------------------------------------ STEP 4
     centroid = (float(np.nanmean(utm[:, 0])), float(np.nanmean(utm[:, 1])))
@@ -4209,6 +4973,13 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
     edge_r = data["edge_right"] if not args.no_edge_extrapolation else 0.0
     log.append(f"[info] edges (final mapping): LEFT (s=0)={edge_l:.2f}m, "
                f"RIGHT (s=s_max)={edge_r:.2f}m")
+    shape_l, shape_r = resolve_edge_shapes(
+        [data.get("edge_method_left")], [data.get("edge_method_right")],
+        mode=args.edge_shape, log=log, bed_fit=args.bed_fit)
+    if (args.bed_fit != "median" and not args.no_edge_extrapolation
+            and min(edge_l, edge_r) <= 0.0):
+        log.append("[warn] distancia a la orilla = 0 en RSL: esa margen se cierra "
+                   "con una pared vertical en el último punto medido")
 
     Ec, Nc = centroid
     theta_section_final = math.atan2(uy_LR, ux_LR)
@@ -4352,17 +5123,25 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         s_pts, cloud["depth"], beam_index=cloud["beam_index"],
         primary=cloud["primary"], mode=args.edge_extent,
         use_primary=(args.edge_anchor == "ref"), log=log)
-    s_grid, depth_grid, s_shift, src_grid = build_profile(
-        s_pts, cloud["depth"], eff_weight,
-        s_data_min, s_data_max, dx=args.dx,
-        bin_half_width=args.bin_half_width,
-        edge_left_dist=edge_l, edge_right_dist=edge_r,
-        beam_index=cloud["beam_index"],
-        primary=cloud["primary"], src=cloud["src"],
-        composite=composite_on, primary_min=args.vb_min,
-        edge_anchor=args.edge_anchor, ref_extent=(ext_lo, ext_hi),
-    )
-    bhw = args.bin_half_width if args.bin_half_width is not None else 2 * args.dx
+    bed_meta = None
+    if args.bed_fit == "median":                       # v6.3 core, untouched
+        s_grid, depth_grid, s_shift, src_grid = build_profile(
+            s_pts, cloud["depth"], eff_weight,
+            s_data_min, s_data_max, dx=args.dx,
+            bin_half_width=args.bin_half_width,
+            edge_left_dist=edge_l, edge_right_dist=edge_r,
+            beam_index=cloud["beam_index"],
+            primary=cloud["primary"], src=cloud["src"],
+            composite=composite_on, primary_min=args.vb_min,
+            edge_anchor=args.edge_anchor, ref_extent=(ext_lo, ext_hi),
+        )
+    else:
+        s_grid, depth_grid, s_shift, src_grid, bed_meta = build_profile_loess(
+            s_pts, cloud["depth"], eff_weight, (ext_lo, ext_hi), edge_l, edge_r,
+            args.dx, h0=bed_halfwidth(args), primary=cloud["primary"],
+            src=cloud["src"], composite=composite_on, primary_min=args.vb_min,
+            shape_l=shape_l, shape_r=shape_r)
+    bhw = bed_halfwidth(args)
     s_pts_final = s_pts + s_shift
     # Geographic origin of the profile (s = 0 = left bank), consistent with the
     # shift build_profile actually applied (reference-anchored banks).
@@ -4371,14 +5150,16 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
             f", composite={'on' if composite_on else 'off'}"
             f", primary_min={args.vb_min}")
     log.append(f"[info] grid: {len(s_grid)} nodes ({s_grid[0]:.2f} → {s_grid[-1]:.2f} m, "
-               f"dx={args.dx} m, bin_half_width={bhw} m, bed={mode})")
+               f"dx={args.dx} m, bin_half_width={bhw} m, bed={mode}, "
+               f"fit={args.bed_fit})")
+    if bed_meta is not None:
+        log.append(f"[info] lecho medido s = {bed_meta['lo']:.2f} a {bed_meta['hi']:.2f} m; "
+                   f"semiancho efectivo mediano {bed_meta['h_med']:.2f} m; "
+                   f"{bed_meta.get('n_down', 0)} puntos primarios con peso robusto < 0,5")
     if np.isfinite(qinfo["q_total"]):
         log.append(f"[info] caudal medido (RiverSurveyor) = {qinfo['q_total']:.3f} m³/s "
                    f"(margen izq {qinfo['q_left']:.3f}, der {qinfo['q_right']:.3f})")
-    _n_int = int(np.count_nonzero(src_grid == SRC_INT))
-    log.append(f"[info] bed source: {int(np.count_nonzero(src_grid == SRC_VB))} nodes VB, "
-               f"{int(np.count_nonzero(src_grid == SRC_BT))} nodes BT, "
-               f"{_n_int} nodes interpolated")
+    _bed_source_log(src_grid, log)
 
     # ------------------------------------------------------------ STEP 6
     csv1, geo_arrays = export_csvs(
@@ -4405,7 +5186,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
                                s_pts_final, cloud["depth"], cloud["beam_index"],
                                s_grid, depth_grid,
                                brazo=brazo, ws_elev=ws_elev, datum_name=datum_name,
-                               river=river)
+                               river=river, src_grid=src_grid, bed_meta=bed_meta,
+                               depth_ref=depth_ref)
     log.append(f"[ok ] {plot1.name}")
     log.append(f"[ok ] {plot2.name}")
 
@@ -4494,6 +5276,9 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         depth_ref=depth_ref, bt_geometry=bt_geometry, composite=composite_on,
         orient_qc=orient_qc, is_group=False, n_reps=1,
         members=[perfil_id],
+        # 6.4
+        edge_methods=(data.get("edge_method_left"), data.get("edge_method_right")),
+        edge_shapes=(shape_l, shape_r), bed_fit=args.bed_fit, bed_meta=bed_meta,
     )
 
 
@@ -4659,6 +5444,10 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
     edge_l = float(np.nanmedian([r["edge_l"] for r in group]))
     edge_r = float(np.nanmedian([r["edge_r"] for r in group]))
     log.append(f"[info] márgenes (mediana del grupo): izq={edge_l:.2f} m, der={edge_r:.2f} m")
+    shape_l, shape_r = resolve_edge_shapes(
+        [(r.get("edge_methods") or (None, None))[0] for r in group],
+        [(r.get("edge_methods") or (None, None))[1] for r in group],
+        mode=args.edge_shape, log=log, bed_fit=args.bed_fit)
 
     # 6.3: the extent is the AVERAGE of the per-(repetition x beam) extents on
     # the common axis, not the envelope of the merged cloud. v6.2 made a group
@@ -4667,15 +5456,26 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         s_pts, cloud["depth"], beam_index=cloud["beam_index"],
         rep=cloud.get("rep"), primary=cloud["primary"], mode=args.edge_extent,
         use_primary=(args.edge_anchor == "ref"), log=log)
-    s_grid, depth_grid, s_shift, src_grid = build_profile(
-        s_pts, cloud["depth"], eff_weight,
-        float(np.nanmin(s_pts)), float(np.nanmax(s_pts)), dx=args.dx,
-        bin_half_width=args.bin_half_width,
-        edge_left_dist=edge_l, edge_right_dist=edge_r,
-        beam_index=cloud["beam_index"], primary=cloud["primary"], src=cloud["src"],
-        composite=ref.get("composite", True), primary_min=args.vb_min,
-        edge_anchor=args.edge_anchor, ref_extent=(ext_lo, ext_hi),
-    )
+    bed_meta = None
+    if args.bed_fit == "median":                       # v6.3 core, untouched
+        s_grid, depth_grid, s_shift, src_grid = build_profile(
+            s_pts, cloud["depth"], eff_weight,
+            float(np.nanmin(s_pts)), float(np.nanmax(s_pts)), dx=args.dx,
+            bin_half_width=args.bin_half_width,
+            edge_left_dist=edge_l, edge_right_dist=edge_r,
+            beam_index=cloud["beam_index"], primary=cloud["primary"], src=cloud["src"],
+            composite=ref.get("composite", True), primary_min=args.vb_min,
+            edge_anchor=args.edge_anchor, ref_extent=(ext_lo, ext_hi),
+        )
+    else:
+        s_grid, depth_grid, s_shift, src_grid, bed_meta = build_profile_loess(
+            s_pts, cloud["depth"], eff_weight, (ext_lo, ext_hi), edge_l, edge_r,
+            args.dx, h0=bed_halfwidth(args), primary=cloud["primary"],
+            src=cloud["src"], composite=ref.get("composite", True),
+            primary_min=args.vb_min, shape_l=shape_l, shape_r=shape_r)
+        log.append(f"[info] lecho medido s = {bed_meta['lo']:.2f} a {bed_meta['hi']:.2f} m "
+                   f"(fit loess, semiancho {bed_meta['h0']:.2f} m)")
+    _bed_source_log(src_grid, log)
     # per-repetition extents, for grupos_qc.csv: if one pass is far from the
     # others it should be a column, not something you infer from the grey band
     _rep_lo, _rep_hi = {}, {}
@@ -4799,7 +5599,8 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
     p2 = plot_cross_section(outdir, gid, progresiva_m,
                             s_pts + s_shift, cloud["depth"], cloud["beam_index"],
                             s_grid, depth_grid, brazo=brazo, ws_elev=ws_elev,
-                            datum_name=datum_name, river=river)
+                            datum_name=datum_name, river=river, src_grid=src_grid,
+                            bed_meta=bed_meta, depth_ref=ref.get("depth_ref", "vb"))
     log.append(f"[ok ] {p2.name}")
     pqc = plot_group_qc(outdir, gid, s_grid, depth_grid, stack, sigma, group,
                         ws_elev=ws_elev, datum_name=datum_name, qstat=qstat)
@@ -4868,6 +5669,8 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         theta_spread_deg=(float(max(devs)) if devs else float("nan")),
         depth_ref=ref.get("depth_ref", ""), bt_geometry=ref.get("bt_geometry", ""),
         composite=ref.get("composite", True), orient_qc=ref.get("orient_qc", {}),
+        # 6.4
+        edge_shapes=(shape_l, shape_r), bed_fit=args.bed_fit, bed_meta=bed_meta,
     )
 
 
@@ -4895,7 +5698,8 @@ def _sort_key(r):
 def write_survey_index(results, resumen_dir: Path, datum_name: str):
     """One row per transect: river, official km, brazo, cotas, ancho, WS source.
     6.1: written with the csv module (notes may contain commas); `recorrido`
-    and `loc_method` appended at the end so existing column positions hold."""
+    and `loc_method` appended at the end so existing column positions hold.
+    6.4: `forma_mi`, `forma_md` (bank shape used) and `bed_fit` appended too."""
     path = resumen_dir / "survey_index.csv"
     rs = sorted(results, key=_sort_key)
 
@@ -4908,7 +5712,8 @@ def write_survey_index(results, resumen_dir: Path, datum_name: str):
         w.writerow(["perfil", "river", "km_oficial_m", "km_oficial", "brazo",
                     "survey_chainage_m", "ws_elev_m", "ws_source", "thalweg_elev_m",
                     "max_depth_m", "width_m", "n_samples", "dist_axis_m",
-                    "theta_flow_deg", "ws_note", "q_m3s", "recorrido", "loc_method"])
+                    "theta_flow_deg", "ws_note", "q_m3s", "recorrido", "loc_method",
+                    "forma_mi", "forma_md", "bed_fit"])
         for r in rs:
             kmo = r.get("km_oficial")
             absolute = r["ws_elev"] is not None
@@ -4921,7 +5726,8 @@ def write_survey_index(results, resumen_dir: Path, datum_name: str):
                 f"{r['max_depth']:.3f}", f"{r['width_m']:.2f}", r["n_samples"],
                 _f(r["dist_axis"], "{:.1f}"), f"{math.degrees(r['theta_flow']):.1f}",
                 r["ws_note"], _f(r.get("q_total"), "{:.3f}"),
-                r.get("recorrido", ""), r.get("loc_method", "")])
+                r.get("recorrido", ""), r.get("loc_method", ""),
+                *(r.get("edge_shapes") or ("", "")), r.get("bed_fit", "")])
     return path
 
 
@@ -5031,7 +5837,8 @@ def _thin_labels(ax, sections, mode="auto", min_sep_px=30.0):
     return kept, dropped
 
 
-def _place_labels(fig, ax, sections, obstacles, fontsize=7.2, pad=2.5):
+def _place_labels(fig, ax, sections, obstacles, fontsize=7.2, pad=2.5,
+                  boxes=None, text_color="0.25", fallback_dot=True):
     """6.2: chainage labels placed so they touch nothing.
 
     v6.1 wrote `format_progresiva(km).split("+")[0] + "k"` at the section
@@ -5044,7 +5851,12 @@ def _place_labels(fig, ax, sections, obstacles, fontsize=7.2, pad=2.5):
 
     A section with a neighbour closer than CROWD_PX starts from the far offsets
     and always gets a thin leader line: in a cluster, proximity alone does not
-    say which label belongs to which section. Returns the number placed."""
+    say which label belongs to which section. Returns the number placed.
+
+    6.4: `boxes` is shared between calls (station labels are placed first and
+    the chainage labels avoid them); a POINT item (xa == xb) gets a horizontal
+    reference direction — with zero length the twelve candidate offsets all
+    collapsed onto the point."""
     if not sections:
         return 0
     rend = fig.canvas.get_renderer()
@@ -5058,13 +5870,14 @@ def _place_labels(fig, ax, sections, obstacles, fontsize=7.2, pad=2.5):
     far = ((22, 16), (22, -16), (30, 20), (30, -20), (38, 26), (38, -26),
            (14, 22), (14, -22), (46, 30), (46, -30))
     ax_bb = ax.get_window_extent()
-    boxes, placed = [], 0
+    boxes = [] if boxes is None else boxes
+    placed = 0
     for ((xa, ya, xb, yb), text, col), is_crowded in zip(sections, crowd):
         pa = ax.transData.transform((xa, ya))
         pb = ax.transData.transform((xb, yb))
         u = pb - pa
-        L = float(np.hypot(*u)) or 1.0
-        u = u / L
+        L = float(np.hypot(*u))
+        u = u / L if L > 1e-6 else np.array([1.0, 0.0])
         n = np.array([-u[1], u[0]])
         done = False
         for end_xy, sgn in (((xb, yb), 1.0), ((xa, ya), -1.0)):
@@ -5075,7 +5888,7 @@ def _place_labels(fig, ax, sections, obstacles, fontsize=7.2, pad=2.5):
                          if (is_crowded or float(np.hypot(*off)) > 16.0) else None)
                 t = ax.annotate(text, end_xy, xytext=(off[0] * k, off[1] * k),
                                 textcoords="offset points", fontsize=fontsize,
-                                color="0.25", ha="left" if off[0] >= 0 else "right",
+                                color=text_color, ha="left" if off[0] >= 0 else "right",
                                 va="bottom" if off[1] >= 0 else "top",
                                 zorder=5, arrowprops=arrow)
                 # Annotation.get_window_extent() unions text AND leader, and the
@@ -5100,7 +5913,7 @@ def _place_labels(fig, ax, sections, obstacles, fontsize=7.2, pad=2.5):
                 t.remove()
             if done:
                 break
-        if not done:
+        if not done and fallback_dot:
             ax.plot([xb], [yb], ".", color=col, ms=3.2, zorder=5)
     return placed
 
@@ -5123,9 +5936,15 @@ def _thousands_axes(ax, threshold=2000.0):
         return False
 
     def _dec(axis):
+        # 6.4: the fewest decimals that write the step EXACTLY. v6.3 used
+        # ceil(-log10(step)): a 0.25 step got one decimal and 5687.25 printed
+        # as 5687.2, next to a real 5687.2.
         t = np.asarray(axis.get_ticklocs(), dtype=float)
         step = float(np.min(np.diff(t))) / 1000.0 if t.size > 1 else 1.0
-        return int(min(3, max(0, math.ceil(-math.log10(step)) if step < 1 else 0)))
+        for d in range(4):
+            if abs(step * 10 ** d - round(step * 10 ** d)) < 1e-6:
+                return d
+        return 3
 
     ax.ticklabel_format(style="plain", useOffset=False)
     for axis in (ax.xaxis, ax.yaxis):
@@ -5154,8 +5973,11 @@ def _crs_axis_labels(crs):
     return f"Este {tag} [m]", f"Norte {tag} [m]"
 
 
+STATION_COLOR = "#c0392b"
+
+
 def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None,
-                         args_labels=None):
+                         args_labels=None, stations=None, stations_read=None):
     """Centerlines + every section axis, coloured by brazo, labelled by the
     river's official chainage.
 
@@ -5163,7 +5985,13 @@ def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None,
     inside it is drawn, so the legend can no longer list a river or a brazo that
     is not in the picture (v6.1 iterated every axis and every anabranch, with no
     de-duplication of the brazo labels at all). Figure size follows the data
-    aspect; labels are placed by _place_labels."""
+    aspect; labels are placed by _place_labels.
+
+    6.4: `stations` (StationRegistry.stations, x/y in the network CRS) are
+    drawn as squares — filled if the gauge was read in this campaign
+    (`stations_read`), hollow if not. Only those inside the window: a gauge
+    30 km away must not shrink the sections to dots. Their labels are placed
+    first and every chainage label avoids them."""
     rs = sorted(results, key=_sort_key)
     all_x = np.concatenate([r["xp"] for r in rs]) if rs else np.array([0.0])
     all_y = np.concatenate([r["yp"] for r in rs]) if rs else np.array([0.0])
@@ -5265,6 +6093,33 @@ def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None,
                 ha="center", va="center", fontsize=10, color="0.15",
                 arrowprops=dict(arrowstyle="-|>", color="0.15", lw=1.4))
 
+    # 6.4: hydrometric stations, clipped to the window (they never enlarge it)
+    st_items = []
+    if stations:
+        tr_st = None
+        net_crs = getattr(network, "crs", None)
+        if net_crs is not None and out_crs is not None \
+                and CRS.from_user_input(net_crs) != CRS.from_user_input(out_crs):
+            tr_st = Transformer.from_crs(net_crs, out_crs, always_xy=True)
+        read = set(stations_read or ())
+        for rec in stations.values():
+            try:
+                x, y = float(rec["x"]), float(rec["y"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if tr_st is not None:
+                x, y = tr_st.transform(x, y)
+            if not (x0 <= x <= x1 and y0 <= y <= y1):
+                continue
+            st_items.append((x, y, str(rec["station_id"]), rec["station_id"] in read))
+        for has, lbl in ((True, "Escala hidrométrica (leída en la campaña)"),
+                         (False, "Escala hidrométrica (sin lectura)")):
+            pts = [q for q in st_items if q[3] == has]
+            if pts:
+                ax.plot([q[0] for q in pts], [q[1] for q in pts], "s", ms=6.5,
+                        mec=STATION_COLOR, mew=1.3,
+                        mfc=STATION_COLOR if has else "white", zorder=6, label=lbl)
+
     rivers = [k for k in dict.fromkeys(r.get("river", "") for r in rs) if k]
     kms = [r["km_oficial"] for r in rs if r.get("km_oficial") is not None]
     fig.text(L / W_IN, 1 - 0.30 / H_IN, "Vista en planta del relevamiento",
@@ -5284,13 +6139,21 @@ def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None,
     fig.canvas.draw()
     obs = [_px_samples(ax, xs, ys) for xs, ys in drawn]
     obs.append(_px_samples(ax, [bx, bx + L_bar], [by, by]))
+    if st_items:
+        obs.append(ax.transData.transform([(q[0], q[1]) for q in st_items]))
     obs = [o for o in obs if len(o)]
+    obs_all = np.vstack(obs) if obs else np.zeros((0, 2))
+    boxes = []
+    if st_items:
+        _place_labels(fig, ax, [((q[0], q[1], q[0], q[1]), q[2], STATION_COLOR)
+                                for q in st_items],
+                      obs_all, fontsize=7.4, boxes=boxes,
+                      text_color=STATION_COLOR, fallback_dot=False)
     keep, drop = _thin_labels(ax, sections,
                               mode=getattr(args_labels, "planview_labels", "auto"))
     for (_xa, _ya, xb, yb), _t, col in drop:      # unlabelled sections keep a tick
         ax.plot([xb], [yb], ".", color=col, ms=3.0, zorder=5)
-    _place_labels(fig, ax, keep,
-                  np.vstack(obs) if obs else np.zeros((0, 2)))
+    _place_labels(fig, ax, keep, obs_all, boxes=boxes)
 
     path = resumen_dir / "survey_plan_view.png"
     fig.savefig(path, dpi=150)
@@ -5761,6 +6624,8 @@ def process_track(matpath: Path, args, network=None, wsm=None, out_crs=None,
         tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
         ex, ny = tr.transform(data["lon"], data["lat"])
         utm = np.column_stack([ex, ny])
+    utm = apply_gnss_lag(utm, data["time"], getattr(args, "gnss_lag", 0.0))
+    utm = apply_antenna_offset(utm, data["heading"], getattr(args, "antenna_offset", None))
 
     # --- spike detection: MARKED, not dropped. For a DTM it matters which
     # returns were rejected and why, so the filter becomes a `spike` column.
@@ -5785,7 +6650,10 @@ def process_track(matpath: Path, args, network=None, wsm=None, out_crs=None,
         dat["bt_beams"] = bt
 
     cloud = build_beam_cloud(dat, utm, depth_ref="vb", bt_geometry="footprints",
-                             bt_avg=args.bt_avg, density_weighting=False)
+                             bt_avg=args.bt_avg, density_weighting=False,
+                             pitch_roll=attitude_signs(args),
+                             beam_layout=resolve_beam_layout(data, args),
+                             antenna_height=getattr(args, "antenna_height", 0.0))
     if len(cloud["E"]) == 0:
         log.append(f"[warn] recorrido {stem}: sin retornos de fondo — omitido")
         return None
@@ -6577,7 +7445,61 @@ def build_parser():
     p.add_argument("--dx", type=float, default=0.5,
                    help="Profile grid spacing in metres (default 0.50).")
     p.add_argument("--bin-half-width", type=float, default=None,
-                   help="Half-width [m] for s-bin sampling (default: 2*dx).")
+                   help="Half-width [m] of the window that informs each bed node. "
+                        "bed-fit loess (6.4): base half-width of the kernel, default "
+                        f"{BED_HALFWIDTH_DEFAULT} m, independent of dx (it widens up to "
+                        f"{BED_WIDEN_FACTOR:g}x only to hold {BED_KNN} points). bed-fit "
+                        "median: default 2*dx, as in v6.3.")
+    p.add_argument("--bed-fit", choices=["loess", "median"], default="loess",
+                   help="6.4: how the bed is estimated from the cloud. 'loess' "
+                        "(default): robust local-linear regression on the primary "
+                        "reference, bank ramps attached afterwards, exact bank "
+                        "positions. 'median': the v6.3 rule (weighted median per "
+                        "node + Savitzky-Golay over the whole grid), kept to compare "
+                        "runs; with dx = 1 it smooths over ~8 m and overshoots where "
+                        "the measured bed meets the ramps.")
+    p.add_argument("--edge-shape", choices=["auto", "triangular", "rectangular"],
+                   default="auto",
+                   help="6.4: bank shape. 'auto' (default) reads what the operator "
+                        "declared in RSL (Setup.Edges_0/1__Method: 2 triangular = "
+                        "ramp to depth 0 at the shore, 1 rectangular = end depth held "
+                        "to the shore and a vertical wall; user-Q edges stay "
+                        "triangular). The other values force both banks.")
+    p.add_argument("--beam-layout", choices=["auto", "ccw", "cw"], default="auto",
+                   help="6.5: slant-beam numbering. 'auto' (default) reads it from "
+                        "the file's Transformation_Matrices (RSL: +X toward beam 1, "
+                        "+Z up), else 'ccw'. 'ccw' = beam 2 to PORT, the M9 layout. "
+                        "'cw' = beam 2 to starboard, the (mirrored) geometry of v3 "
+                        "to v6.4, only to reproduce old runs.")
+    p.add_argument("--pitch-roll", choices=["off", "on", "inv"], default="off",
+                   help="6.4: tilt the beams by the ensemble's pitch/roll before "
+                        "placing the footprints; 'off' (default) = level instrument. "
+                        "6.5: the signs are --pitch-sign / --roll-sign ('inv' flips "
+                        "both, the 6.4 spelling). Off by default because SonTek does "
+                        "not document the M9 sign and a wrong sign doubles the "
+                        "footprint error; tools/diagnostico_mat.py estimates it.")
+    p.add_argument("--pitch-sign", choices=sorted(PITCH_SIGNS), default="bow-up",
+                   help="6.5: what a POSITIVE Compass.Pitch does: 'bow-up' (default) "
+                        "or 'bow-down'.")
+    p.add_argument("--roll-sign", choices=sorted(ROLL_SIGNS), default="stbd-down",
+                   help="6.5: what a POSITIVE Compass.Roll does: 'stbd-down' "
+                        "(default) or 'port-down'; 'none' applies the pitch only, for "
+                        "when the roll sign could not be determined.")
+    p.add_argument("--antenna-offset", default=None,
+                   help="6.5: horizontal position of the transducer relative to the "
+                        "GNSS antenna in the boat frame, 'fwd,stbd' [m] (e.g. "
+                        "'0.40,-0.15'). Only if it was not entered in RSL "
+                        "(Setup.offsetX/Y). tools/diagnostico_mat.py [6] estimates it "
+                        "from opposite passes. Default none.")
+    p.add_argument("--gnss-lag", type=float, default=0.0,
+                   help="6.5: GNSS latency [s]; each position is moved lag x boat "
+                        "velocity forward. tools/diagnostico_mat.py estimates it "
+                        "from opposite passes. Default 0.")
+    p.add_argument("--antenna-height", type=float, default=0.0,
+                   help="6.5: height [m] of the GNSS antenna phase centre above the "
+                        "transducer face. With pitch-roll on, a tilted mast moves the "
+                        "antenna away from the transducer by height*sin(tilt); "
+                        "default 0.")
     p.add_argument("--water-surface-elev", type=float, default=0.0,
                    help="Constant water-surface elevation [m] used only when no "
                         "--water-surface-csv is given (bed_elev = WSE - depth).")
@@ -7073,22 +7995,30 @@ def _run(runlog):
 
     # --- hydrometric stations (secondary water surface) -------------------- #
     station_ws = None
+    registry = None
     if args.stations:
         if network is None:
             setup_log.append("[warn] --stations ignored: needs --centerline")
-        elif not args.readings:
-            setup_log.append("[warn] --stations given without --readings: no level "
-                             "readings to build a water surface — stations ignored")
         else:
+            # 6.4: the registry is built even without readings, so the gauges
+            # still appear on the plan view
             try:
                 registry = StationRegistry(
                     args.stations, network,
                     crs_override=(args.stations_crs or args.ws_crs), log=setup_log)
-                mode, rdata = read_level_readings(args.readings)
-                station_ws = StationWS(registry, mode, rdata, log=setup_log)
             except Exception as e:
-                setup_log.append(f"[warn] could not build station water surface: {e}")
-                station_ws = None
+                setup_log.append(f"[warn] could not read the station registry: {e}")
+            if registry is not None and not args.readings:
+                setup_log.append("[warn] --stations given without --readings: no level "
+                                 "readings to build a water surface — the gauges are "
+                                 "only drawn on the plan view")
+            elif registry is not None:
+                try:
+                    mode, rdata = read_level_readings(args.readings)
+                    station_ws = StationWS(registry, mode, rdata, log=setup_log)
+                except Exception as e:
+                    setup_log.append(f"[warn] could not build station water surface: {e}")
+                    station_ws = None
 
     # --- water-surface model (GNSS + gauges on the network paths) ---------- #
     wsm = None
@@ -7233,8 +8163,10 @@ def _run(runlog):
     prof = write_survey_profiles(results, resumen)
     print(f"[ok ] {idx.relative_to(survey_root)}")
     print(f"[ok ] {prof.relative_to(survey_root)}")
-    pv = plot_survey_planview(results, network, resumen, out_crs=out_crs,
-                              args_labels=args)
+    pv = plot_survey_planview(
+        results, network, resumen, out_crs=out_crs, args_labels=args,
+        stations=(registry.stations if registry is not None else None),
+        stations_read=(set(station_ws.data) if station_ws is not None else set()))
     print(f"[ok ] {pv.relative_to(survey_root)}")
     lp = plot_long_profile(results, wsm, resumen, datum_name, network=network)
     if lp:
