@@ -74,7 +74,36 @@ puntos GNSS a ambos lados):
 Una escala de control a más de 0,5 m del pelo interpolado entre puntos GNSS
 avisa en consola: salto sin declarar o cero de escala mal cargado.
 
-## 4. Compatibilidad
+## 4. Figura bloqueada: la corrida no se corta
+
+Si un `.png` de salida está abierto en otro programa (visor, OneDrive,
+antivirus), Windows no deja sobrescribirlo y v6.5 abortaba al final de la
+corrida con `PermissionError`, después de procesar todas las transectas. Ahora
+se guarda al lado con sufijo horario (`survey_long_profile_153556.png`) y se
+avisa en consola.
+
+## 5. `[ubicacion]` y aviso de vértice
+
+Las secciones forzadas a lo largo del Dique Ballester (azimut ~64°) cortan el
+brazo MI cerca de su unión con el principal, y el principal tiene ahí un quiebre
+(km 29+486.75). El cruce se proyecta sobre el principal para la progresiva, y
+todo punto del lado exterior del quiebre cae en el vértice: dos secciones a
+~110 m entre sí dieron 29+486.75 las dos y se agruparon como repeticiones. Otra
+cortaba el principal 25 m aguas abajo de la unión y quedó como MD por la
+tolerancia de la isla.
+
+```ini
+[ubicacion]
+sec_ballester_a = Neuquen | 29+500
+20260904121016  = Neuquen | 29+560 | principal
+```
+
+Fuerza río, progresiva y brazo (transecta, grupo o nombre de `[grupos]`), también
+en el pre-escaneo, así que la cobertura de pelo de agua y el agrupamiento usan
+esa progresiva. Avisos nuevos en el log de la transecta: progresiva exactamente
+en un vértice del eje, y sección forzada que corta el eje a menos de 45°.
+
+## 6. Compatibilidad
 
 Sin `[orientacion]` ni `[saltos]` la salida es idéntica a v6.5
 (`survey_profiles_all.csv` byte a byte en el caso sintético de referencia).

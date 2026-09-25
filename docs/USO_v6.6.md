@@ -371,6 +371,25 @@ flow` figura como `SKIPPED`. La flecha de flujo en planta sigue siendo la
 medida. En un grupo basta con forzar un miembro (o el nombre del grupo): se
 aplica a todo el grupo, con la traza de todas las repeticiones.
 
+### Ubicación forzada (`[ubicacion]`, 6.6)
+
+Una sección se ubica donde su línea cruza un eje. Eso falla con secciones
+forzadas a lo largo de una obra: la línea corta el eje en ángulo agudo, puede
+cruzar los dos brazos de una isla que termina en la presa, y un punto proyectado
+sobre la parte exterior de un quiebre del eje cae justo en el vértice (dos
+secciones a 100 m entre sí reciben la misma progresiva). Para esas secciones:
+
+```ini
+[ubicacion]
+sec_ballester_a = Neuquen | 29+500               ; grupo o transecta
+20260904121016  = Neuquen | 29+560 | principal    ; brazo: principal | MD | MI ...
+```
+
+Sin brazo, o con `principal`, la sección es del cauce principal y en el perfil
+longitudinal se une con las de aguas abajo. Aviso en el log de la transecta
+cuando una sección forzada corta el eje a menos de 45° o cuando su progresiva cae
+exactamente en un vértice del eje.
+
 ### Figuras
 
 | Clave | Default | Notas |
@@ -573,7 +592,10 @@ Las capas muy grandes caen a GeoPackage (`.gpkg`) pasando ~1,5 M de features.
 9. Los `[warn] gauge ...: X m from the surface interpolated`: una escala de
    control lejos del pelo GNSS suele ser un salto sin declarar en `[saltos]`.
 10. En `survey_plan_view.png`, las secciones al pie de estructuras: si alguna
-    cruza la obra, forzarla en `[orientacion]`.
+    cruza la obra, forzarla en `[orientacion]`, y fijar su progresiva y brazo
+    en `[ubicacion]`.
+11. Dos secciones con la misma progresiva al centímetro: buscar el aviso de
+    vértice en su log.
 
 ---
 

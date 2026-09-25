@@ -25,6 +25,13 @@ Changes in 6.6:
       gauge becomes QC only if GNSS points bracket it WITHOUT a jump between;
       a QC gauge more than 0.5 m off the GNSS surface now warns of an
       undeclared jump.
+    * [ubicacion]: river, official chainage and brazo forced per transect or
+      group ('<rio> | <progresiva> [| <brazo>]'), for sections the crossing
+      rule cannot place (e.g. along the gates of a dam, crossing both arms of
+      an island that ends there). A forced-orientation section meeting the
+      axis at < 45 deg now warns that its crossing is ill-conditioned.
+    * A figure whose file is locked (open in a viewer, OneDrive, antivirus)
+      no longer aborts the run: it is saved with a time suffix and warned.
 
 Changes in 6.5:
     * BEAM NUMBERING. v3 to v6.4 placed beam 2 to STARBOARD; on the M9 it is
@@ -357,7 +364,7 @@ WS_AMBIG_MARGIN = 25.0
 # 6.1: a gauge or GNSS point farther than this [m] from its river's axis (or
 # projected onto an axis END, i.e. beyond the digitised reach, by more than
 # STATION_END_TOL) is not used for the water surface: its chainage would be wrong.
-STATION_AXIS_TOL = 250.0
+STATION_AXIS_TOL = 300.0
 # 6.6: a QC gauge this far [m] from the GNSS-interpolated surface suggests an
 # undeclared water-surface jump between the points (see [saltos])
 WS_JUMP_HINT = 0.5
@@ -2017,6 +2024,32 @@ def project_to_axis(
 # ============================================================================ #
 #  STEP 4b — river chainage (progresiva)
 # ============================================================================ #
+
+def _savefig(fig, path, dpi=150):
+    """6.6: save a figure without aborting the run when the file is locked.
+
+    On Windows a PNG left open in a viewer, or held by OneDrive / an antivirus
+    scan, makes open(..., 'w+b') raise PermissionError — at the END of a run,
+    after every transect was processed. The figure is then written next to
+    it with a time suffix and the run goes on. Returns the path written, or
+    None if nothing could be written."""
+    path = Path(path)
+    try:
+        fig.savefig(path, dpi=dpi)
+        return path
+    except OSError as e:
+        alt = path.with_name(f"{path.stem}_{datetime.datetime.now():%H%M%S}{path.suffix}")
+        try:
+            fig.savefig(alt, dpi=dpi)
+            print(f"[warn] {path.name}: no se pudo sobrescribir ({e.__class__.__name__}: "
+                  f"{e.strerror or e}) — ¿abierto en otro programa? Guardado como {alt.name}")
+            return alt
+        except OSError as e2:
+            print(f"[warn] {path.name}: no se pudo guardar ({e2}) — figura omitida")
+            return None
+    finally:
+        plt.close(fig)
+
 
 def format_progresiva(p_m: float) -> str:
     """Argentine chainage notation: metres -> 'k+mmm.mm' (e.g. 12340.5 -> '12+340.50').
@@ -4648,8 +4681,7 @@ def plot_plan_view(outdir: Path, perfil_id: str, progresiva_m,
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     path = outdir / "plan_view_map.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    path = _savefig(fig, path)
     return path
 
 
@@ -4811,8 +4843,7 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
     fig.subplots_adjust(left=0.075, right=0.985, top=0.845,
                         bottom=0.185 + 0.04 * (rows - 1))
     path = outdir / "cross_section.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    path = _savefig(fig, path)
     return path
 
 
@@ -5038,6 +5069,98 @@ def _manual_river(args, network, perfil_id, log=None):
     return river
 
 
+def _manual_location(args, network, ident, cx=None, cy=None, members=(), log=None):
+    """6.6: [ubicacion] — river, chainage and brazo forced for a transect or a
+    group ('<rio> | <progresiva oficial> [| <brazo>]'). Looked up by `ident`,
+    then by the members, then by any [grupos] name holding `ident`. Returns a
+    locate_track()-shaped dict, or None."""
+    ov = getattr(args, "location_overrides", None) or {}
+    if not ov or network is None:
+        return None
+    raw = ov.get(ident)
+    keys = [ident] + list(members)
+    if raw is None:
+        for k in members:
+            if k in ov:
+                raw = ov[k]; break
+    if raw is None:
+        for gname, ids in (getattr(args, "manual_groups", None) or {}).items():
+            if gname in ov and any(k in ids for k in keys):
+                raw = ov[gname]; break
+    if raw is None:
+        return None
+    parts = [q.strip() for q in str(raw).split("|")]
+    by_norm = {_norm_name(ax.river): ax.river for ax in network.axes}
+    river = by_norm.get(_norm_name(parts[0])) if parts else None
+    if river is None or len(parts) < 2:
+        if log is not None:
+            log.append(f"[warn] [ubicacion] {ident} = {raw}: se esperaba "
+                       "'<rio> | <progresiva> [| <brazo>]' con un río del eje — ignorado")
+        return None
+    try:
+        km_of = _parse_chainage(parts[1])
+    except ValueError:
+        if log is not None:
+            log.append(f"[warn] [ubicacion] {ident}: progresiva '{parts[1]}' ilegible — ignorado")
+        return None
+    ax = network._by_river[river]
+    km_i = km_of - network.river_offsets.get(river, 0.0)
+    b = _norm_name(parts[2]) if len(parts) > 2 else ""
+    role, brazo = ROLE_MAIN, ""
+    if b and b not in ("principal", "main", "cauce principal", "-"):
+        labs = {_norm_name(a["label"] or ""): a["label"] for a in ax.anabranches if a["label"]}
+        mains = {_norm_name(i["main_label"] or ""): i["main_label"]
+                 for i in ax.islands if i["main_label"]}
+        if b in labs:
+            role, brazo = ROLE_ANAB, labs[b]
+        elif b in mains:
+            brazo = mains[b]
+        elif log is not None:
+            log.append(f"[warn] [ubicacion] {ident}: brazo '{parts[2]}' no existe en el "
+                       f"eje del {river} (válidos: principal, "
+                       + ", ".join(sorted(set(labs.values()) | set(mains.values())))
+                       + ") — se usa el cauce principal")
+    if not (-1.0 <= km_i <= ax.main.length + 1.0) and log is not None:
+        log.append(f"[warn] [ubicacion] {ident}: km {format_progresiva(km_of)} fuera del "
+                   f"eje digitalizado del {river}")
+    dist = float("nan")
+    if cx is not None and cy is not None:
+        q = ax.main.interpolate(min(max(km_i, 0.0), ax.main.length))
+        dist = math.hypot(q.x - cx, q.y - cy)
+    return dict(river=river, role=role, brazo=brazo, km_internal=float(km_i),
+                km_oficial=float(km_of), dist=dist, method="manual",
+                note="[ubicacion] del .ini")
+
+
+def _shallow_crossing_warn(network, river, km_internal, theta_section, log, label,
+                           forced=True):
+    """6.6: a section meeting the axis at a shallow angle has an ill-defined
+    crossing (a few degrees move it tens of metres; near a bend its projection
+    can land on a vertex). Warn and point to [ubicacion]."""
+    try:
+        m = network._by_river[river].main
+        a = m.interpolate(max(km_internal - 10.0, 0.0))
+        b = m.interpolate(min(km_internal + 10.0, m.length))
+        t = math.atan2(b.y - a.y, b.x - a.x)
+    except Exception:
+        return
+    ang = 90.0 - _ang_diff_180(theta_section, t + math.pi / 2.0)
+    if not forced:
+        ang = 90.0          # flow-normal sections: only the vertex check
+    # a point projected onto the outside of a bend of the main line lands
+    # EXACTLY on the vertex: every section there gets the same chainage
+    cs = np.asarray(m.coords)
+    cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(cs, axis=0).T))])
+    if np.min(np.abs(cum[1:-1] - km_internal)) < 0.01 if cum.size > 2 else False:
+        log.append(f"[warn] {label}: la progresiva cae exactamente en un vértice del eje "
+                   f"del {river} (quiebre) — varias secciones pueden recibir la misma; "
+                   "fijarla en [ubicacion] del .ini")
+    if ang < 45.0:
+        log.append(f"[warn] {label}: la sección corta el eje del {river} a {ang:.0f}° — "
+                   "cruce mal condicionado, la progresiva y el brazo son dudosos; "
+                   "fijarlos en [ubicacion] del .ini")
+
+
 def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, out_crs=None,
                 datum_name: str = DATUM_NAME_DEFAULT,
                 survey_outdir: Path | None = None, quiet: bool = False):
@@ -5247,9 +5370,16 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
             [Ec + s_lo * ux_LR, Ec + s_hi * ux_LR],
             [Nc + s_lo * uy_LR, Nc + s_hi * uy_LR])))
         force = _manual_river(args, network, perfil_id, log)
-        loc = network.locate_track(tx, ty, force_river=force,
-                                   method=getattr(args, "transect_locate", "crossing"),
-                                   section=sec)
+        loc = _manual_location(args, network, perfil_id, float(np.nanmean(tx)),
+                               float(np.nanmean(ty)), log=log)           # 6.6
+        if loc is None:
+            loc = network.locate_track(tx, ty, force_river=force,
+                                       method=getattr(args, "transect_locate", "crossing"),
+                                       section=sec)
+            if str(loc["method"]).startswith("crossing"):
+                _shallow_crossing_warn(network, loc["river"], loc["km_internal"],
+                                       theta_section, log, perfil_id,
+                                       forced=bool(orient_forced))
         river = loc["river"]; role = loc["role"]; brazo = loc["brazo"]
         km_internal = loc["km_internal"]; progresiva_m = loc["km_oficial"]
         dist_axis = loc["dist"]; loc_method = loc["method"]; loc_note = loc["note"]
@@ -5412,8 +5542,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
                                brazo=brazo, ws_elev=ws_elev, datum_name=datum_name,
                                river=river, src_grid=src_grid, bed_meta=bed_meta,
                                depth_ref=depth_ref)
-    log.append(f"[ok ] {plot1.name}")
-    log.append(f"[ok ] {plot2.name}")
+    for _pl in (plot1, plot2):
+        if _pl: log.append(f"[ok ] {_pl.name}")
 
     # ------------------------------------------------------------ STEP 8
     if HAS_GPD:
@@ -5557,8 +5687,7 @@ def plot_group_qc(outdir: Path, gid: str, s_grid, depth_grid, stack, sigma,
 
     fig.tight_layout()
     path = outdir / "grupo_repetibilidad.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    path = _savefig(fig, path)
     return path
 
 
@@ -5752,7 +5881,13 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
             trm = Transformer.from_crs(r["utm_crs"], network.crs, always_xy=True)
             a, b = trm.transform(np.asarray(u)[:, 0], np.asarray(u)[:, 1])
             txs.append(np.asarray(a)); tys.append(np.asarray(b))
-        if txs:
+        man = (_manual_location(args, network, gid, float(np.mean(np.concatenate(txs))),
+                                float(np.mean(np.concatenate(tys))),
+                                members=[r["perfil"] for r in group], log=log)
+               if txs else None)                                          # 6.6
+        if man is not None:
+            loc = man
+        elif txs:
             trc = Transformer.from_crs(ref["utm_crs"], network.crs, always_xy=True)
             s_lo, s_hi = float(np.nanmin(s_pts)), float(np.nanmax(s_pts))
             sec = tuple(zip(*trc.transform(
@@ -5768,8 +5903,9 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
             loc.update(method="centroid", note="")
         river, role, brazo = loc["river"], loc["role"], loc["brazo"]
         km_internal, progresiva_m, dist_axis = loc["km_internal"], loc["km_oficial"], loc["dist"]
-        loc_method = ref.get("loc_method") or loc["method"]
-        loc_note = loc["note"] if loc["method"] == "nearest" else ""
+        loc_method = ("manual" if man is not None
+                      else (ref.get("loc_method") or loc["method"]))
+        loc_note = loc["note"] if loc["method"] in ("nearest", "manual") else ""
         path_rank, recorrido, survey_chainage = network.display_position(river, km_internal)
         log.append(f"[info] río={river} [{role}]" + (f" ({brazo})" if brazo else "")
                    + f"   km oficial {progresiva_m:.2f} m "
@@ -5841,10 +5977,10 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
                             s_grid, depth_grid, brazo=brazo, ws_elev=ws_elev,
                             datum_name=datum_name, river=river, src_grid=src_grid,
                             bed_meta=bed_meta, depth_ref=ref.get("depth_ref", "vb"))
-    log.append(f"[ok ] {p2.name}")
+    if p2: log.append(f"[ok ] {p2.name}")
     pqc = plot_group_qc(outdir, gid, s_grid, depth_grid, stack, sigma, group,
                         ws_elev=ws_elev, datum_name=datum_name, qstat=qstat)
-    log.append(f"[ok ] {pqc.name}")
+    if pqc: log.append(f"[ok ] {pqc.name}")
 
     if HAS_GPD:
         ax_path = export_axis_shp(outdir, gid, progresiva_m, axis_origin,
@@ -6397,8 +6533,7 @@ def plot_survey_planview(results, network, resumen_dir: Path, out_crs=None,
     _place_labels(fig, ax, keep, obs_all, boxes=boxes)
 
     path = resumen_dir / "survey_plan_view.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    path = _savefig(fig, path)
     return path
 
 
@@ -6587,8 +6722,7 @@ def plot_long_profile(results, wsp, resumen_dir: Path, datum_name: str, network=
         _legend_unique(ax, loc="best", fontsize=8)
     fig.tight_layout()
     path = resumen_dir / "survey_long_profile.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    path = _savefig(fig, path)
     return path
 
 
@@ -6638,8 +6772,7 @@ def _plot_long_profile_simple(results, wsp, resumen_dir: Path, datum_name: str):
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     path = resumen_dir / "survey_long_profile.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    path = _savefig(fig, path)
     return path
 
 
@@ -7262,8 +7395,7 @@ def plot_tracks_planview(tracks, network, results, resumen_dir: Path, out_crs=No
     _legend_unique(ax, loc="upper right", fontsize=8, markerscale=4,
                    framealpha=0.85)
     path = resumen_dir / "tracks_plan_view.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    path = _savefig(fig, path)
     return path
 
 
@@ -7320,7 +7452,11 @@ def prescan_transects(matfiles, network, args=None, log: list | None = None):
             tx, ty = tr_c.transform(utm[:, 0], utm[:, 1])
             stem = Path(m).stem
             force = _manual_river(args, network, stem, log) if args is not None else None
-            loc = network.locate_track(tx, ty, force_river=force, method=method)
+            loc = (_manual_location(args, network, stem, float(np.nanmean(tx)),
+                                    float(np.nanmean(ty)), log=log)
+                   if args is not None else None)                         # 6.6
+            if loc is None:
+                loc = network.locate_track(tx, ty, force_river=force, method=method)
             # 6.2: a cross-section covers ~no chainage; a longitudinal run covers
             # hundreds of metres. Only a warning — nothing is reclassified alone.
             span = nota = None
@@ -7529,12 +7665,13 @@ def load_config(path, parser=None, log: list | None = None):
     known = [proc, camp, prog, gsec, _find_section(cp, _RIVER_SECTIONS),
              _find_section(cp, _TRACK_SECTIONS),          # 6.2: [recorridos]
              _find_section(cp, _ORIENT_SECTIONS),         # 6.6: [orientacion]
-             _find_section(cp, _JUMP_SECTIONS)]           # 6.6: [saltos]
+             _find_section(cp, _JUMP_SECTIONS),           # 6.6: [saltos]
+             _find_section(cp, _LOC_SECTIONS)]            # 6.6: [ubicacion]
     for sec in cp.sections():
         if sec not in known:
             log.append(f"[warn] config: unknown section [{sec}] — ignored (valid: "
                        "[campanha], [procesamiento], [progresivas], [grupos], "
-                       "[rios], [recorridos], [orientacion], [saltos])")
+                       "[rios], [recorridos], [orientacion], [saltos], [ubicacion])")
 
     return params, campania, river_offsets, manual_groups
 
@@ -7620,6 +7757,24 @@ def resolve_jumps(raw, network, log):
             log.append(f"[warn] [saltos] '{name} = {val}': no se pudo interpretar "
                        f"({e}) — ignorado")
     return out
+
+
+_LOC_SECTIONS = ["ubicacion", "ubicación", "ubicaciones", "location"]
+
+
+def load_location_overrides(path):
+    """{transect or group id: 'rio | progresiva [| brazo]'} from [ubicacion] (6.6)."""
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    try:
+        cp.read(Path(path), encoding="utf-8")
+    except Exception:
+        return {}
+    sec = _find_section(cp, _LOC_SECTIONS)
+    if not sec:
+        return {}
+    return {str(k).strip(): str(v).strip() for k, v in cp.items(sec)
+            if v is not None and str(v).strip()}
 
 
 _TRACK_SECTIONS = ["recorridos", "recorrido", "tracks"]
@@ -8189,6 +8344,8 @@ def _run(runlog):
                           if pre_args.config else {})
     args.track_overrides = (load_track_overrides(pre_args.config)  # 6.2: [recorridos]
                             if pre_args.config else {})
+    args.location_overrides = (load_location_overrides(pre_args.config)
+                               if pre_args.config else {})                  # 6.6
     args.orient_overrides, _orient_bad = (load_orientation_overrides(pre_args.config)
                                           if pre_args.config else ({}, []))   # 6.6
     datum_name = args.datum_name
@@ -8322,6 +8479,10 @@ def _run(runlog):
                 setup_log.append(f"[info] [orientacion] {k}: no es el id de una "
                                  "transecta de entrada — se aplicará si coincide con "
                                  "el id de un grupo")
+
+    if args.location_overrides:
+        setup_log.append("[info] [ubicacion] overrides: " + ", ".join(
+            f"{k} -> {v}" for k, v in args.location_overrides.items()))
 
     prescan = []
     if network is not None:
@@ -8513,7 +8674,7 @@ def _run(runlog):
         results, network, resumen, out_crs=out_crs, args_labels=args,
         stations=(registry.stations if registry is not None else None),
         stations_read=(set(station_ws.data) if station_ws is not None else set()))
-    print(f"[ok ] {pv.relative_to(survey_root)}")
+    if pv: print(f"[ok ] {pv.relative_to(survey_root)}")
     lp = plot_long_profile(results, wsm, resumen, datum_name, network=network)
     if lp:
         print(f"[ok ] {lp.relative_to(survey_root)}")
@@ -8568,7 +8729,7 @@ def _run(runlog):
                     export_track_cloud([t], d, args, out_crs, stem=t["file"])
             tpv = plot_tracks_planview(tracks, network, results, resumen,
                                        out_crs=out_crs)
-            print(f"[ok ] {tpv.relative_to(survey_root)}")
+            if tpv: print(f"[ok ] {tpv.relative_to(survey_root)}")
             n_pts = int(sum(t["n_pts"] for t in tracks))
             cls = {}
             for t in tracks:
