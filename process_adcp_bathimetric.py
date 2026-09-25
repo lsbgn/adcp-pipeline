@@ -2,12 +2,29 @@
 """
 process_adcp_bathimetric.py
 ================================================================================
-ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.5)
+ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.6)
 
 Builds a hydraulically consistent 1D bathymetric cross-section perpendicular
 to the mean flow, from a SonTek M9/S5 .mat file (RiverSurveyor Live export).
 
 Velocities are NOT exported. Only the bed profile and supporting QA artifacts.
+
+Changes in 6.6:
+    * [orientacion]: per transect or group, the section line can be forced to
+      the boat track ('recorrido': principal axis of the in-transect GNSS
+      positions) or to a compass azimuth, instead of the flow normal. For a
+      section run along the gates of a structure, where the local flow is not
+      the river's and the flow-normal line cuts across the structure. Of the
+      two senses of the line, the one closer to the flow-based azimuth is
+      kept, so s = 0 stays the left bank. The perpendicularity QA is SKIPPED
+      (logged) for a forced section. A forced member forces its whole group.
+    * [saltos]: water-surface discontinuities (weir, dam, gates) by river and
+      official chainage or by coordinates. Each network path is cut into
+      reaches at its jumps: interpolation, extrapolation, slope fits, junction
+      estimates and gauge bracketing only use values of the same reach. A
+      gauge becomes QC only if GNSS points bracket it WITHOUT a jump between;
+      a QC gauge more than 0.5 m off the GNSS surface now warns of an
+      undeclared jump.
 
 Changes in 6.5:
     * BEAM NUMBERING. v3 to v6.4 placed beam 2 to STARBOARD; on the M9 it is
@@ -313,7 +330,7 @@ except Exception as e:
 DATUM_NAME_DEFAULT = "IGN SRVN16"
 
 # Script version (reported in logs and the traceability record).
-__version__ = "6.5"
+__version__ = "6.6"
 
 # 6.1: water-surface extrapolation beyond the last value of a path (slope
 # continuation) is reported as a WARNING only past this distance [m]; shorter
@@ -341,6 +358,9 @@ WS_AMBIG_MARGIN = 25.0
 # projected onto an axis END, i.e. beyond the digitised reach, by more than
 # STATION_END_TOL) is not used for the water surface: its chainage would be wrong.
 STATION_AXIS_TOL = 250.0
+# 6.6: a QC gauge this far [m] from the GNSS-interpolated surface suggests an
+# undeclared water-surface jump between the points (see [saltos])
+WS_JUMP_HINT = 0.5
 STATION_END_TOL = 50.0
 
 # 6.1: transect location by SECTION CROSSING — the track's principal axis is
@@ -1250,6 +1270,123 @@ def flow_direction_for(data: dict, utm: np.ndarray, args, log: list | None = Non
                    f"{math.degrees(th_plain) + 90.0:+.1f}°, "
                    f"Δ={math.degrees(theta_flow - th_plain):+.2f}°]")
     return theta_flow, theta_section
+
+
+# 6.6: [orientacion] — per-transect override of the section azimuth.
+_ORIENT_SECTIONS = ["orientacion", "orientación", "orientaciones", "orientation"]
+_ORIENT_TRACK = ("track", "recorrido", "embarcacion", "embarcación", "lancha", "trayectoria")
+_ORIENT_FLOW = ("flow", "flujo", "auto")
+
+
+def parse_orientation_spec(val):
+    """INI value -> ('track', None) | ('flow', None) | ('azimuth', deg) | None.
+    A number is a compass azimuth of the SECTION line [deg, clockwise from North];
+    its sense (0/180) is irrelevant, the L->R convention is resolved later."""
+    v = _norm_name(str(val or "")).replace(" ", "")
+    if not v:
+        return None
+    if v in [_norm_name(t) for t in _ORIENT_TRACK]:
+        return ("track", None)
+    if v in _ORIENT_FLOW:
+        return ("flow", None)
+    try:
+        return ("azimuth", float(v.replace(",", ".")) % 360.0)
+    except ValueError:
+        return None
+
+
+def track_axis(utm_list, step_list=None):
+    """Principal axis of the boat track(s): (theta [rad, math CCW from East,
+    in (-pi/2, pi/2]], linearity = 1 - sqrt(l2/l1), n points). Only in-transect
+    ensembles (System.Step == 3) when there are >= 5 of them: the stationary
+    bank ensembles are a GNSS scatter blob, not a direction."""
+    pts = []
+    for i, u in enumerate(utm_list):
+        u = np.asarray(u, dtype=float)
+        ok = np.isfinite(u).all(axis=1)
+        if step_list is not None and step_list[i] is not None:
+            st = np.asarray(step_list[i], dtype=float)
+            if st.shape[0] == u.shape[0] and np.count_nonzero(ok & (st == 3)) >= 5:
+                ok &= (st == 3)
+        if np.count_nonzero(ok) >= 2:
+            pts.append(u[ok] - u[ok].mean(axis=0))   # own centroid per track
+    if not pts:
+        return None, 0.0, 0
+    X = np.vstack(pts)
+    ev, evec = np.linalg.eigh(np.cov(X.T))
+    v = evec[:, int(np.argmax(ev))]
+    th = math.atan2(v[1], v[0])
+    if th <= -math.pi / 2: th += math.pi
+    if th > math.pi / 2:   th -= math.pi
+    lin = 1.0 - math.sqrt(max(ev.min(), 0.0) / ev.max()) if ev.max() > 0 else 0.0
+    return th, float(lin), int(X.shape[0])
+
+
+def apply_orientation_override(spec, theta_flow, theta_section, utm_list,
+                               step_list, log, label):
+    """Replace the flow-perpendicular theta_section by the forced one.
+
+    The forced LINE is fixed (track axis or given azimuth); of its two senses we
+    keep the one closer to the flow-based theta_section, so s = 0 is still the
+    LEFT bank looking downstream wherever the flow is readable. Returns
+    (theta_section, tag) — tag None when nothing was forced."""
+    if spec is None or spec[0] == "flow":
+        return theta_section, None
+    if spec[0] == "track":
+        phi, lin, n = track_axis(utm_list, step_list)
+        if phi is None:
+            log.append(f"[warn] [orientacion] {label}: sin traza GNSS utilizable — "
+                       "se mantiene la sección normal al flujo")
+            return theta_section, None
+        tag = "recorrido"
+        extra = f"eje principal de {n} posiciones, linealidad {lin:.2f}"
+        if lin < 0.80:
+            log.append(f"[warn] [orientacion] {label}: la traza no es recta "
+                       f"(linealidad {lin:.2f} < 0.80) — el eje del recorrido es "
+                       "poco representativo; revisar la planta")
+    else:
+        phi = math.radians(90.0 - spec[1])          # compass -> math
+        tag = f"azimut {spec[1]:.1f}°"
+        extra = "fijado en el .ini"
+    cands = [phi, phi + math.pi]
+    diffs = [abs((c - theta_section + math.pi) % (2 * math.pi) - math.pi) for c in cands]
+    k = int(np.argmin(diffs))
+    th_new = math.atan2(math.sin(cands[k]), math.cos(cands[k]))
+    dev = math.degrees(diffs[k])
+    perp = _ang_diff_180(th_new, theta_flow + math.pi / 2.0)
+    az = (90.0 - math.degrees(th_new)) % 180.0
+    log.append(f"[info] ORIENTACIÓN FORZADA ({tag}): theta_section = "
+               f"{math.degrees(th_new):+.1f}° (azimut de la línea {az:.1f}°/"
+               f"{az + 180:.1f}°; {extra}); gira {dev:.1f}° respecto de la "
+               f"normal al flujo")
+    if 75.0 <= dev <= 105.0:
+        log.append(f"[warn] [orientacion] {label}: la línea forzada es casi paralela "
+                   "al flujo medido — el sentido izquierda/derecha (s = 0) queda "
+                   "indeterminado; verificar qué margen quedó en s = 0")
+    return th_new, f"{tag} ({perp:.0f}° de la normal al flujo)"
+
+
+def load_orientation_overrides(path):
+    """{transect or group id: spec} from the INI [orientacion] section (6.6)."""
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    try:
+        cp.read(Path(path), encoding="utf-8")
+    except Exception:
+        return {}, []
+    sec = _find_section(cp, _ORIENT_SECTIONS)
+    if not sec:
+        return {}, []
+    out, bad = {}, []
+    for k, v in cp.items(sec):
+        if v is None or not str(v).strip():
+            continue
+        spec = parse_orientation_spec(v)
+        if spec is None:
+            bad.append(f"{k} = {v}")
+        else:
+            out[str(k).strip()] = spec
+    return out, bad
 
 
 def section_orientation_qc(theta_section: float, utm: np.ndarray,
@@ -3135,9 +3272,29 @@ class WaterSurfaceModel:
     def __init__(self, network, points=None, station_ws=None, qc_tol=0.10,
                  skipped=None, log=None, extrap_tol=WS_EXTRAP_TOL_DEFAULT,
                  slope_min_span=WS_SLOPE_MIN_SPAN_DEFAULT,
-                 slope_max=WS_SLOPE_MAX_DEFAULT / 1000.0, default_slope=None):
+                 slope_max=WS_SLOPE_MAX_DEFAULT / 1000.0, default_slope=None,
+                 jumps=None):
         self._log = log if log is not None else []
         self.network = network
+        # 6.6: [saltos] — water-surface discontinuities (weirs, dams, gates).
+        # Each path is cut into reaches at its jumps; interpolation,
+        # extrapolation, slope fits, gauge bracketing and junction estimates
+        # never use a value from the other side of a jump. A value exactly at
+        # the jump chainage belongs to the DOWNSTREAM reach.
+        self.jumps = list(jumps or [])
+        self._jump_p = {}
+        for j in self.jumps:
+            pos = network.path_positions(j["river"], j["s"])
+            for pi, p in pos:
+                self._jump_p.setdefault(pi, []).append((float(p), j["id"]))
+            self._log.append(
+                f"[info] salto '{j['id']}': {j['river']} km "
+                f"{format_progresiva(network.river_offsets.get(j['river'], 0.0) + j['s'])}"
+                + ("" if pos else " — fuera de todo trayecto de la red, IGNORADO")
+                + (" — el pelo de agua no se interpola ni extrapola a través de él"
+                   if pos else ""))
+        for pi in self._jump_p:
+            self._jump_p[pi].sort()
         self.station_ws = station_ws
         self.qc_tol = float(qc_tol)
         self.extrap_tol = float(extrap_tol)
@@ -3311,6 +3468,12 @@ class WaterSurfaceModel:
             self._log.append(
                 f"[QA] gauge {g['id']} ({g['name']}) between GNSS points: {g['h']:.3f} m vs "
                 f"GNSS {res['ws_elev']:.3f} m, Δ={dif:+.3f} m (tol {self.qc_tol:.2f}) {tag}")
+            if abs(dif) > WS_JUMP_HINT:
+                self._log.append(
+                    f"[warn] gauge {g['id']}: {abs(dif):.2f} m from the surface "
+                    "interpolated between GNSS points — a weir, dam or gate between them? "
+                    "Declare it in [saltos] so each side keeps its own surface; otherwise "
+                    "check the gauge zero and the reading.")
         seen = set()
         for pi, seq in enumerate(sol["per_path"]):
             for (pa, a), (pb, b) in zip(seq, seq[1:]):
@@ -3349,11 +3512,49 @@ class WaterSurfaceModel:
         out.sort(key=lambda t: t[0])
         return out
 
+    def _reach(self, pi, p):
+        """Index of the reach of path `pi` holding p (0 = above every jump)."""
+        js = self._jump_p.get(pi)
+        if not js:
+            return 0
+        return bisect.bisect_right([q for q, _n in js], float(p))
+
+    def _same_reach(self, pi, on, p):
+        """The (p, anchor) of `on` lying in the same reach of path `pi` as p."""
+        if not self._jump_p.get(pi):
+            return on
+        k = self._reach(pi, p)
+        return [(q, a) for q, a in on if self._reach(pi, q) == k]
+
+    def _reach_label(self, pi, p):
+        js = self._jump_p.get(pi) or []
+        k = self._reach(pi, p)
+        up = js[k - 1][1] if k > 0 else None
+        dn = js[k][1] if k < len(js) else None
+        if up and dn:
+            return f"tramo entre los saltos '{up}' y '{dn}'"
+        return f"tramo aguas abajo del salto '{up}'" if up else \
+            f"tramo aguas arriba del salto '{dn}'"
+
+    def jumps_on_path(self, pi):
+        """[(p, id)] of the declared jumps on path `pi`."""
+        return list(self._jump_p.get(pi, []))
+
+    def _split_reaches(self, pi, seq):
+        """`seq` [(p, anchor)] cut at the jumps of path `pi`."""
+        if not self._jump_p.get(pi):
+            return [seq] if seq else []
+        out = {}
+        for q, a in seq:
+            out.setdefault(self._reach(pi, q), []).append((q, a))
+        return [out[k] for k in sorted(out)]
+
     def _bracketed(self, river, s):
         """True when GNSS points lie both upstream and downstream of (river, s)
-        along some path — a gauge there is a QC point, not an anchor."""
+        along some path — a gauge there is a QC point, not an anchor.
+        6.6: only GNSS points of the SAME reach (no jump in between) count."""
         for pi, p in self.network.path_positions(river, s):
-            on = self._on_path(pi, self.gnss)
+            on = self._same_reach(pi, self._on_path(pi, self.gnss), p)
             if any(q < p - 0.5 for q, _ in on) and any(q > p + 0.5 for q, _ in on):
                 return True
         return False
@@ -3379,7 +3580,9 @@ class WaterSurfaceModel:
             per_path = self._solve(None)["per_path"]
         except Exception:
             per_path = []
-        for seq in per_path:
+        reaches = [rch for pi, seq in enumerate(per_path)
+                   for rch in self._split_reaches(pi, seq)]       # 6.6
+        for seq in reaches:
             s, span, n = self._fit_slope(seq, self.slope_min_span)
             if s is None or s > 0 or abs(s) > self.slope_max or span <= best[1]:
                 continue
@@ -3436,7 +3639,7 @@ class WaterSurfaceModel:
         if not branches:
             return None
         pi0, pj0 = next(iter(branches.values()))[0]
-        on0 = self._on_path(pi0, anchors)
+        on0 = self._same_reach(pi0, self._on_path(pi0, anchors), pj0)   # 6.6
         if any(abs(p - pj0) <= 0.5 and a["kind"] != "junction" for p, a in on0):
             return None                              # a measured value sits on the node
         down = [(p - pj0, p, a) for p, a in on0 if p > pj0 + 0.5]
@@ -3444,7 +3647,7 @@ class WaterSurfaceModel:
         for br, plist in branches.items():
             best = None
             for pi, pj in plist:
-                on = self._on_path(pi, anchors)
+                on = self._same_reach(pi, self._on_path(pi, anchors), pj)  # 6.6
                 ups = [(pj - p, p, a) for p, a in on if p < pj - 0.5]
                 if ups:
                     du, pu, au = min(ups, key=lambda t: t[0])
@@ -3513,8 +3716,11 @@ class WaterSurfaceModel:
         self._cache[key] = sol
         return sol
 
-    def _eval_on_path(self, seq, p):
-        """Water surface at path chainage p from the path's values `seq`."""
+    def _eval_on_path(self, seq, p, pi=None):
+        """Water surface at path chainage p from the path's values `seq`.
+        6.6: with `pi`, only the values of p's own reach (between jumps)."""
+        if pi is not None and self._jump_p.get(pi):
+            seq = self._same_reach(pi, seq, p)
         if not seq:
             return None
         ps = [q[0] for q in seq]
@@ -3562,11 +3768,15 @@ class WaterSurfaceModel:
         sol = self._solve(when)
         evals = []
         for pi, p in pos:
-            e = self._eval_on_path(sol["per_path"][pi], p)
+            e = self._eval_on_path(sol["per_path"][pi], p, pi)
             if e is not None:
                 evals.append((pi, p, e))
         if not evals:
-            out["note"] = f"no GNSS point, gauge or junction value on any path through {river}"
+            cut = [self._reach_label(pi, p) for pi, p in pos if self._jump_p.get(pi)]
+            out["note"] = (f"no GNSS point, gauge or junction value in the "
+                           f"{cut[0]} (6.6 [saltos]: values beyond a jump are not used)"
+                           if cut else
+                           f"no GNSS point, gauge or junction value on any path through {river}")
             return out
         interp = [t for t in evals if t[2]["source"] != "extrap"]
         use = interp or evals
@@ -3607,6 +3817,9 @@ class WaterSurfaceModel:
             for a in self.gnss + self.gauges:
                 if a.get("river") == river and lo - step <= a["s"] <= hi + step:
                     g.append(float(a["s"]))
+            for j in self.jumps:                               # 6.6: sharp step
+                if j["river"] == river and lo - step <= j["s"] <= hi + step:
+                    g += [float(j["s"]) - 0.01, float(j["s"])]
             g = np.unique(np.asarray(g + [lo, hi], dtype=float))
             vals, srcs, notes = [], [], []
             for s in g:
@@ -3629,7 +3842,7 @@ class WaterSurfaceModel:
         seq = self._solve(None)["per_path"][pi]
         out = []
         for p in p_values:
-            e = self._eval_on_path(seq, float(p))
+            e = self._eval_on_path(seq, float(p), pi)
             out.append(np.nan if e is None else e["value"])
         return np.asarray(out, dtype=float)
 
@@ -4708,7 +4921,7 @@ def export_raw_beam_points_shp(outdir: Path, perfil_id: str, cloud: dict, s_pts:
 def acceptance_tests(theta_flow: float, theta_section: float,
                       s_grid: np.ndarray, depth_grid: np.ndarray,
                       edge_left: float,
-                      log: list[str]):
+                      log: list[str], forced: str | None = None):
     # Perpendicularity test (works modulo 180° because the section is invariant
     # under axis flip). Reduce the angle to [-90, 90], then the deviation from
     # perpendicular is |90 − |a||.
@@ -4718,9 +4931,14 @@ def acceptance_tests(theta_flow: float, theta_section: float,
     if a < -90: a += 180
     perp_err = abs(90.0 - abs(a))
     ok_perp = perp_err <= 10.0
-    log.append(f"[QA] axis perpendicular to flow within ±10°? "
-               f"{'PASS' if ok_perp else 'FAIL'} "
-               f"(deviation = {perp_err:.1f}°)")
+    if forced:
+        ok_perp = True          # 6.6: deliberately not perpendicular
+        log.append(f"[QA] axis perpendicular to flow within ±10°? SKIPPED "
+                   f"(orientación forzada: {forced})")
+    else:
+        log.append(f"[QA] axis perpendicular to flow within ±10°? "
+                   f"{'PASS' if ok_perp else 'FAIL'} "
+                   f"(deviation = {perp_err:.1f}°)")
 
     ok_left = abs(s_grid[0]) < 1e-3
     log.append(f"[QA] left bank at s = 0?  "
@@ -4944,6 +5162,12 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
     # discharge vector, restricted to the in-transect ensembles. See
     # compute_flow_direction() for why both corrections matter.
     theta_flow, theta_section = flow_direction_for(data, utm, args, log)
+    # 6.6: [orientacion] — e.g. a section run along the gates of a structure,
+    # where the flow direction is not the river's and the flow-normal line
+    # would cut across the structure.
+    theta_section, orient_forced = apply_orientation_override(
+        (getattr(args, "orient_overrides", None) or {}).get(perfil_id),
+        theta_flow, theta_section, [utm], [data.get("step")], log, perfil_id)
 
     # ------------------------------------------------------------ STEP 3
     layout = resolve_beam_layout(data, args, log)
@@ -5209,7 +5433,7 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
 
     # ------------------------------------------------------------ STEP 9  (QA)
     acceptance_tests(theta_flow, theta_section_final, s_grid, depth_grid,
-                     edge_left=edge_l, log=log)
+                     edge_left=edge_l, log=log, forced=orient_forced)
     if network is not None and np.isfinite(dist_axis):
         width = float(s_grid[-1] - s_grid[0])
         ok_axis = dist_axis <= max(50.0, 0.75 * width)
@@ -5266,7 +5490,7 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         cloud_depth=cloud["depth"], cloud_beam_index=cloud["beam_index"],
         cloud_ens=cloud["ens"], cloud_rel=cloud_rel,
         # ---- v6: everything the aforo grouping engine needs ----
-        theta_section=theta_section_final,
+        theta_section=theta_section_final, orient_forced=orient_forced,
         t_start=t_start,
         prof_E=geo["E"], prof_N=geo["N"],
         q_total=qinfo["q_total"], q_left=qinfo["q_left"], q_right=qinfo["q_right"],
@@ -5421,6 +5645,22 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
 
     # ---- group axis: pooled unit-discharge direction of all in-transect ens.
     theta_flow, theta_section = group_flow_direction(group, args, log)
+    # 6.6: [orientacion] by group id, or inherited from any forced member
+    ov = getattr(args, "orient_overrides", None) or {}
+    spec = ov.get(gid)
+    if spec is None:
+        specs = [ov[r["perfil"]] for r in group if r["perfil"] in ov]
+        spec = specs[0] if specs else None
+        if len({str(x) for x in specs}) > 1:
+            log.append("[warn] [orientacion] miembros del grupo con orientaciones "
+                       f"distintas — se usa la de {next(r['perfil'] for r in group if r['perfil'] in ov)}")
+        if specs and len(specs) < len(group):
+            log.append("[info] [orientacion] orientación forzada en parte del grupo: "
+                       "se aplica a todo el grupo")
+    theta_section, orient_forced = apply_orientation_override(
+        spec, theta_flow, theta_section,
+        [r["utm_ref"] for r in group],
+        [(r.get("data_ref") or {}).get("step") for r in group], log, gid)
     ux_LR, uy_LR = -math.cos(theta_section), -math.sin(theta_section)
     theta_section_final = math.atan2(uy_LR, ux_LR)
 
@@ -5617,7 +5857,7 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         if pp: log.append(f"[ok ] {pp.name}")
 
     acceptance_tests(theta_flow, theta_section_final, s_grid, depth_grid,
-                     edge_left=edge_l, log=log)
+                     edge_left=edge_l, log=log, forced=orient_forced)
     try:
         (outdir / "process_log.txt").write_text("\n".join(log) + "\n", encoding="utf-8")
     except Exception:
@@ -5649,6 +5889,7 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         width_m=float(s_grid[-1] - s_grid[0]),
         thalweg_elev=thalweg_elev, max_depth=float(np.nanmax(depth_grid)),
         theta_flow=theta_flow, theta_section=theta_section_final,
+        orient_forced=orient_forced,
         n_samples=int(sum(r["n_samples"] for r in group)),
         utm_crs=utm_crs, posgar_crs=posgar_crs, log=log,
         cloud_xp=np.asarray(cxp), cloud_yp=np.asarray(cyp), cloud_z=cloud_z,
@@ -6250,8 +6491,19 @@ def plot_long_profile(results, wsp, resumen_dir: Path, datum_name: str, network=
         x0, x1 = float(ps.min()) - pad, float(ps.max()) + pad
         if absolute and model is not None:
             pg = np.linspace(x0, x1, 800)
+            jl = model.jumps_on_path(pi) if hasattr(model, "jumps_on_path") else []
+            if jl:                                             # 6.6: vertical step
+                pg = np.unique(np.concatenate(
+                    [pg] + [[q - 0.01, q] for q, _n in jl if x0 <= q <= x1]))
             ax.plot(pg / 1000.0, model.path_series(pi, pg), "-", color="navy", lw=1.5,
                     label="Pelo de agua (modelo de la red)", zorder=2)
+            for q, nm in jl:
+                if x0 <= q <= x1:
+                    ax.axvline(q / 1000.0, color="tab:purple", ls=":", lw=1.2, zorder=1)
+                    ax.annotate(f"salto: {nm}", (q / 1000.0, 0.0),
+                                xycoords=("data", "axes fraction"), rotation=90,
+                                fontsize=8, color="tab:purple", ha="right", va="bottom",
+                                xytext=(-3, 4), textcoords="offset points")
             mk = model.path_markers(pi)
 
             def inr(t, lo=x0, hi=x1):
@@ -7275,12 +7527,14 @@ def load_config(path, parser=None, log: list | None = None):
                 manual_groups[str(gname).strip()] = ids
 
     known = [proc, camp, prog, gsec, _find_section(cp, _RIVER_SECTIONS),
-             _find_section(cp, _TRACK_SECTIONS)]          # 6.2: [recorridos]
+             _find_section(cp, _TRACK_SECTIONS),          # 6.2: [recorridos]
+             _find_section(cp, _ORIENT_SECTIONS),         # 6.6: [orientacion]
+             _find_section(cp, _JUMP_SECTIONS)]           # 6.6: [saltos]
     for sec in cp.sections():
         if sec not in known:
             log.append(f"[warn] config: unknown section [{sec}] — ignored (valid: "
                        "[campanha], [procesamiento], [progresivas], [grupos], "
-                       "[rios], [recorridos])")
+                       "[rios], [recorridos], [orientacion], [saltos])")
 
     return params, campania, river_offsets, manual_groups
 
@@ -7304,6 +7558,68 @@ def load_river_overrides(path):
         return {}
     return {str(k).strip(): str(v).strip() for k, v in cp.items(sec)
             if v is not None and str(v).strip()}
+
+
+_JUMP_SECTIONS = ["saltos", "salto", "discontinuidades", "jumps", "weirs"]
+
+
+def _parse_chainage(txt):
+    """'29487', '29487.5', '29+487.50' -> metres (float)."""
+    t = str(txt).strip().replace(" ", "")
+    m = re.fullmatch(r"(-?)(\d+)\+(\d+(?:[.,]\d*)?)", t)
+    if m:
+        v = int(m.group(2)) * 1000.0 + float(m.group(3).replace(",", "."))
+        return -v if m.group(1) else v
+    return float(t.replace(",", "."))
+
+
+def load_jump_overrides(path):
+    """[(name, value)] from the INI [saltos] section (6.6), unresolved."""
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    try:
+        cp.read(Path(path), encoding="utf-8")
+    except Exception:
+        return []
+    sec = _find_section(cp, _JUMP_SECTIONS)
+    if not sec:
+        return []
+    return [(str(k).strip(), str(v).strip()) for k, v in cp.items(sec)
+            if v is not None and str(v).strip()]
+
+
+def resolve_jumps(raw, network, log):
+    """[(name, 'rio | progresiva')] or [(name, 'x y')] -> [dict(id, river, s)].
+
+    'rio | progresiva': official chainage (same numbers as the outputs,
+    'm' or 'k+mmm'), converted to internal with the [progresivas] offset.
+    'x y': coordinates in the centerline CRS, projected on the nearest axis."""
+    out = []
+    by_norm = {_norm_name(ax.river): ax.river for ax in network.axes}
+    for name, val in raw:
+        try:
+            if "|" in val:
+                rv, km = [q.strip() for q in val.split("|", 1)]
+                river = by_norm.get(_norm_name(rv))
+                if river is None:
+                    log.append(f"[warn] [saltos] {name}: río '{rv}' no está en el eje — ignorado")
+                    continue
+                s_int = _parse_chainage(km) - network.river_offsets.get(river, 0.0)
+            else:
+                xy = [float(q.replace(",", ".")) for q in re.split(r"[;\s]+", val) if q]
+                if len(xy) != 2:
+                    raise ValueError("se esperaba 'rio | progresiva' o 'x y'")
+                loc = network.locate_all(xy[0], xy[1])[0]
+                if loc["dist"] > STATION_AXIS_TOL:
+                    log.append(f"[warn] [saltos] {name}: a {loc['dist']:.0f} m del eje "
+                               f"del {loc['river']} (> {STATION_AXIS_TOL:.0f} m) — ignorado")
+                    continue
+                river, s_int = loc["river"], float(loc["km_internal"])
+            out.append(dict(id=name, river=river, s=float(s_int)))
+        except (TypeError, ValueError, IndexError) as e:
+            log.append(f"[warn] [saltos] '{name} = {val}': no se pudo interpretar "
+                       f"({e}) — ignorado")
+    return out
 
 
 _TRACK_SECTIONS = ["recorridos", "recorrido", "tracks"]
@@ -7665,6 +7981,12 @@ def build_parser():
                    help="Per-campaign level readings CSV. Spot (station_id, nivel) "
                         "or time-series (station_id, datetime, nivel), auto-detected. "
                         "ws_elev = gauge_zero + nivel.")
+    p.add_argument("--ws-axis-tol", type=float, default=STATION_AXIS_TOL,
+                   help="6.5: a GNSS water-surface point or a gauge farther than this "
+                        "[m] from its river's axis is not used: its chainage would be "
+                        f"doubtful (default {STATION_AXIS_TOL:.0f}). Raise it for a wide "
+                        "floodplain or an axis that does not follow the channel; check "
+                        "the point's km in water_surface_qc.csv afterwards.")
     p.add_argument("--ws-qc-tol", type=float, default=0.10,
                    help="Tolerance [m] for the water-surface QC: gauges between GNSS "
                         "points vs the GNSS surface, and the spread of the tributaries' "
@@ -7867,7 +8189,14 @@ def _run(runlog):
                           if pre_args.config else {})
     args.track_overrides = (load_track_overrides(pre_args.config)  # 6.2: [recorridos]
                             if pre_args.config else {})
+    args.orient_overrides, _orient_bad = (load_orientation_overrides(pre_args.config)
+                                          if pre_args.config else ({}, []))   # 6.6
     datum_name = args.datum_name
+    # 6.5: distance to the river axis beyond which a GNSS water-surface point or
+    # a gauge is not used (module constants read by WaterSurfaceModel and
+    # StationRegistry at call time)
+    global STATION_AXIS_TOL
+    STATION_AXIS_TOL = float(args.ws_axis_tol)
 
     if not args.matfiles:
         sys.exit("[error] no inputs given (pass .mat/folder/glob on the command "
@@ -7979,6 +8308,21 @@ def _run(runlog):
             "already inert in v6.0): the section azimuth is always taken "
             "perpendicular to the mean flow. Remove the key or leave it at 'flow'.")
 
+    # 6.6: [orientacion]
+    for b in _orient_bad:
+        setup_log.append(f"[warn] [orientacion] '{b}': valor no reconocido — usar "
+                         "recorrido | flujo | <azimut en grados> — ignorado")
+    if args.orient_overrides:
+        setup_log.append("[info] [orientacion] overrides: " + ", ".join(
+            f"{k} -> {v[0] if v[0] != 'azimuth' else f'azimut {v[1]:.1f}°'}"
+            for k, v in args.orient_overrides.items()))
+        stems = {m.stem for m in matfiles}
+        for k in args.orient_overrides:
+            if k not in stems and k not in (args.manual_groups or {}):
+                setup_log.append(f"[info] [orientacion] {k}: no es el id de una "
+                                 "transecta de entrada — se aplicará si coincide con "
+                                 "el id de un grupo")
+
     prescan = []
     if network is not None:
         if args.manual_rivers:
@@ -8026,12 +8370,14 @@ def _run(runlog):
         _dslope = None
         if str(args.ws_default_slope).strip().lower() not in ("auto", ""):
             _dslope = float(args.ws_default_slope) / 1000.0
+        _jraw = load_jump_overrides(pre_args.config) if pre_args.config else []
         wsm = WaterSurfaceModel(network, points=ws_pts_net, station_ws=station_ws,
                                 qc_tol=args.ws_qc_tol, skipped=ws_skipped,
                                 log=setup_log, extrap_tol=args.ws_extrap_tol,
                                 slope_min_span=args.ws_slope_min_span,
                                 slope_max=args.ws_slope_max / 1000.0,
-                                default_slope=_dslope)
+                                default_slope=_dslope,
+                                jumps=resolve_jumps(_jraw, network, setup_log))
     elif ws_table is not None and network is None:
         setup_log.append("[warn] --water-surface-csv ignored: needs --centerline")
 
