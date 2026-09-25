@@ -2828,7 +2828,7 @@ def read_ws_table(csv_path, east_col="East", north_col="North", elev_col="H_corr
         rd.fieldnames = cols
         ec = _pick_col(cols, east_col, ["east", "x", "este", "x_utm", "x_posgar07"])
         nc = _pick_col(cols, north_col, ["north", "y", "norte", "y_utm", "y_posgar07"])
-        hc = _pick_col(cols, elev_col, ["h_correg", "z", "elev", "cota", "h", "altura"])
+        hc = _pick_col(cols, elev_col, ["height", "h_correg", "z", "elev", "cota", "h", "altura"])
         ic = _pick_col(cols, None, ["punto", "point", "id", "name", "nombre", "pto", "pt"])
         rc = _pick_col(cols, None, ["rio", "río", "river"])      # 6.1: optional override
         if not (ec and nc and hc):
