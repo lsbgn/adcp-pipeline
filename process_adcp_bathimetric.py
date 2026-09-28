@@ -2,12 +2,54 @@
 """
 process_adcp_bathimetric.py
 ================================================================================
-ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.6)
+ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.7)
 
 Builds a hydraulically consistent 1D bathymetric cross-section perpendicular
 to the mean flow, from a SonTek M9/S5 .mat file (RiverSurveyor Live export).
 
 Velocities are NOT exported. Only the bed profile and supporting QA artifacts.
+
+Changes in 6.7:
+    * GNSS SCREENING OF THE BOAT TRACK (position-fill = bt, default). v6.6
+      used GPS.UTM as recorded. The M9's internal receiver is mostly
+      autonomous (GGA quality 1): its ~2 m bias is harmless while HDOP and the
+      constellation are stable, but when a satellite enters or leaves the fix
+      jumps several metres ALONG the section, s is stretched or folded, and
+      the perpendicular-offset penalty cannot see it (campaign 2026-04-15,
+      20260415122618: HDOP 22.6 at the start edge and 16.5 mid-crossing, edge
+      ensembles placed 10 m into the channel, bed saw-toothed). Now:
+        - HDOP filter as QRev: HDOP > gga-hdop-max (4) invalid, then HDOP
+          farther than gga-hdop-change (2) from the mean of the valid ones.
+        - GGA-BT consistency: GGA - (integrated bottom-track track) is a slow
+          offset (receiver bias, compass misalignment, moving bed); a fix
+          more than gga-bt-tol (1.5 m) off its local linear trend over
+          +-gga-bt-window (30 s) is a jump even with a normal HDOP.
+        - Each invalid position is rebuilt from the bottom-track increments
+          between the valid fixes on either side, closure spread linearly in
+          time (traverse adjustment); open ends hang from the nearest valid
+          fix. position-fill = interp interpolates in time instead (no BT),
+          off reproduces v6.6 exactly.
+        - VALID GGA POSITIONS ARE NOT TOUCHED: a clean transect gives the same
+          profile, byte for byte, as in v6.6.
+      GGA quality is NOT filtered (QRev's default >= 2 would reject nearly the
+      whole campaign); it is reported.
+      Applied to transects, tracks (recorridos) and the location pre-scan
+      (HDOP only there).
+    * QA: s FOLD-BACK — largest backward excursion of s along the direction
+      of travel over the Step 3 ensembles, with the final positions;
+      [warn] above s-fold-tol (2 m). A boat backing over the same bed is
+      harmless; a large fold means two depths at the same s.
+    * QA: EDGE DRIFT — the edge ensembles of a bank (Step 2/4) spread more
+      than edge-drift-tol (5 m) across or along the section line: the boat
+      drifted while "stationary" at the bank and measured another bed
+      (20260415131650: 21 m across the line during the start edge). Warned
+      only; the offset penalty already removes the far returns from the fit.
+    * GNSS dropouts (0/0) are no longer dropped from the cloud: they are
+      rebuilt from bottom track like any other invalid fix (gps-max-gap still
+      rejects a transect with too many).
+    * plan_view_map.png shows the recorded GGA track (grey) and the rebuilt
+      positions; survey_index.csv appends gga_q, pos_hdop, pos_jump,
+      pos_rebuilt, pos_shift_max_m, s_fold_m, edge_drift_m.
 
 Changes in 6.6:
     * [orientacion]: per transect or group, the section line can be forced to
@@ -337,7 +379,7 @@ except Exception as e:
 DATUM_NAME_DEFAULT = "IGN SRVN16"
 
 # Script version (reported in logs and the traceability record).
-__version__ = "6.6"
+__version__ = "6.7"
 
 # 6.1: water-surface extrapolation beyond the last value of a path (slope
 # continuation) is reported as a WARNING only past this distance [m]; shorter
@@ -525,6 +567,21 @@ def extract_data(mat: dict) -> dict:
     # faja 2 -> faja 7). Invalidated here, once, before anything else reads it.
     lat, lon, utm, n_nofix = _mask_gnss_dropouts(lat, lon, utm)
 
+    # 6.7: what the GNSS screening needs — HDOP / quality / satellites of each
+    # GGA fix and the bottom-track boat velocity (ENU when coordinateSystem = 2)
+    def _gps_vec(name):
+        v = get_field(gps, name)
+        if v is None:
+            return None
+        v = np.asarray(v, dtype=float).ravel()
+        return v if v.size == len(vb_depth) else None
+    hdop = _gps_vec("HDOP")
+    gga_quality = _gps_vec("GPS_Quality")
+    n_sats = _gps_vec("Satellites")
+    bt_vel = get_field(bt, "BT_Vel")
+    bt_vel = np.asarray(bt_vel, dtype=float) if bt_vel is not None else None
+    coord_sys = _opt_scalar(get_field(setp, "coordinateSystem"))
+
     heading    = np.asarray(
         get_field(sysd, "True_North_ADP_Heading",
                   default=get_field(sysd, "Heading")),
@@ -616,6 +673,8 @@ def extract_data(mat: dict) -> dict:
         edge_left=edge_left, edge_right=edge_right, start_edge=start_edge,
         edge_method_left=edge_method_left, edge_method_right=edge_method_right,
         sensor_depth=sensor_depth, depth_reference=depth_reference,
+        hdop=hdop, gga_quality=gga_quality, n_sats=n_sats,
+        bt_vel=bt_vel, coord_sys=coord_sys,
     )
 
 
@@ -1738,6 +1797,330 @@ def apply_antenna_offset(utm, heading, offset, log=None):
         log.append(f"[info] antenna-offset: transductor {fx:+.2f} m hacia proa, "
                    f"{fy:+.2f} m hacia estribor de la antena")
     return P
+
+
+# ============================================================================ #
+#  6.7 — GNSS SCREENING OF THE BOAT TRACK (HDOP + GGA/bottom-track consistency)
+# ============================================================================ #
+
+GGA_HDOP_MAX_DEFAULT = 4.0       # QRev technical manual: HDOP > 4 invalid
+GGA_HDOP_CHANGE_DEFAULT = 2.0    # |HDOP - mean of valid| above this invalid
+GGA_BT_TOL_DEFAULT = 1.5         # [m] GGA fix vs its local GGA-BT offset trend
+GGA_BT_WINDOW_DEFAULT = 30.0     # [s] half-window of that local linear trend
+S_FOLD_TOL_DEFAULT = 2.0         # [m] backward excursion of s that is warned
+EDGE_DRIFT_TOL_DEFAULT = 5.0     # [m] edge ensembles off / along the section
+
+POS_GGA = 0      # GGA position kept as recorded
+POS_BT = 1       # rebuilt from bottom-track increments between valid GGA anchors
+POS_INTERP = 2   # linear interpolation in time between valid GGA anchors (no BT)
+POS_RAW = 3      # invalid GGA kept because nothing better exists
+
+POS_SRC_NAMES = {POS_GGA: "gga", POS_BT: "bt", POS_INTERP: "interp", POS_RAW: "raw"}
+
+
+def hdop_filter(hdop, ok, hmax, hchange):
+    """QRev GGA HDOP filter: HDOP > hmax invalid; then, iteratively, HDOP that
+    departs from the mean of the valid ones by more than hchange invalid."""
+    h = np.asarray(hdop, dtype=float).ravel()
+    good = ok & np.isfinite(h)
+    if hmax is not None and hmax > 0:
+        good &= h <= hmax
+    if hchange is not None and hchange > 0:
+        for _ in range(20):
+            if good.sum() < 2:
+                break
+            m = float(np.mean(h[good]))
+            new = good & (np.abs(h - m) <= hchange)
+            if np.array_equal(new, good):
+                break
+            good = new
+    return good
+
+
+def bt_boat_velocity(bt_vel, n):
+    """Boat velocity over the bed (E, N) from BottomTrack.BT_Vel.
+
+    RiverSurveyor stores the velocity of the BED relative to the boat, so the
+    boat moves at -BT_Vel (checked on campaign 2026-04-15: the integrated
+    -BT_Vel track and the GGA track agree in direction in every file). Invalid
+    samples (non-finite, or faster than 10 m/s) are linearly interpolated in
+    time, as QRev does for boat velocities. Returns (v, valid) or (None, None)."""
+    if bt_vel is None:
+        return None, None
+    v = np.asarray(bt_vel, dtype=float)
+    if v.ndim != 2 or v.shape[0] != n or v.shape[1] < 2:
+        return None, None
+    v = -v[:, :2].copy()
+    ok = np.isfinite(v).all(axis=1) & (np.hypot(v[:, 0], v[:, 1]) < 10.0)
+    if ok.sum() < 2:
+        return None, None
+    idx = np.arange(n)
+    for j in (0, 1):
+        v[~ok, j] = np.interp(idx[~ok], idx[ok], v[ok, j])
+    return v, ok
+
+
+def ensemble_dt(time):
+    t = np.asarray(time, dtype=float).ravel()
+    dt = np.diff(t, prepend=np.nan)
+    good = np.isfinite(dt) & (dt > 0) & (dt < 60)
+    med = float(np.median(dt[good])) if good.any() else 1.0
+    dt[~good] = med
+    return dt
+
+
+def _robust_offset_model(t, r, ok, window, tol, max_iter=10):
+    """Local linear model of r(t) = GGA - BT (bias of the autonomous fix plus
+    slow BT drift: compass misalignment, moving bed). Fitted on the ensembles
+    still considered valid, inside +-window s of each ensemble; ensembles whose
+    residual exceeds `tol` are declared inconsistent and the model refitted
+    until nothing changes. Returns (valid mask, model at every t)."""
+    n = len(t)
+    good = ok.copy()
+    model = np.full((n, 2), np.nan)
+    for _ in range(max_iter):
+        if good.sum() < 3:
+            break
+        for i in range(n):
+            w = good & (np.abs(t - t[i]) <= window)
+            if w.sum() < 3:
+                w = good
+            tt = t[w] - t[i]
+            A = np.column_stack([np.ones(w.sum()), tt]) if np.ptp(tt) > 1e-6 \
+                else np.ones((w.sum(), 1))
+            for j in (0, 1):
+                coef, *_ = np.linalg.lstsq(A, r[w, j], rcond=None)
+                model[i, j] = coef[0]
+        res = np.hypot(*(r - model).T)
+        new = ok & (res <= tol)
+        if np.array_equal(new, good):
+            break
+        good = new
+    return good, model
+
+
+def resolve_boat_positions(utm, hdop, bt_vel, time, mode="bt", hdop_max=4.0,
+                           hdop_change=1.0, bt_tol=1.5, bt_window=30.0):
+    """6.7: GNSS screening and gap filling of the boat track.
+
+    1. HDOP filter (QRev): HDOP > hdop_max, or off the transect mean by more
+       than hdop_change, is invalid.
+    2. GGA-BT consistency (mode bt): the offset GGA - (integrated BT track)
+       varies slowly along a crossing; a GGA fix more than bt_tol metres off
+       its local linear trend is a jump (constellation change, multipath) even
+       with a normal HDOP, and is invalid.
+    3. Every invalid position is rebuilt: between two valid anchors, from the
+       BT increments with the closure spread linearly in time (traverse
+       adjustment); before the first / after the last anchor, from the BT
+       increments from that anchor. Without BT (mode interp, or BT unusable):
+       linear interpolation in time; ends held at the nearest anchor.
+    Valid GGA positions are returned UNCHANGED (a clean transect is byte for
+    byte the same as without the filter)."""
+    P0 = np.asarray(utm, dtype=float)
+    n = P0.shape[0]
+    t = np.asarray(time, dtype=float).ravel()
+    if t.size != n or not np.all(np.isfinite(t)):
+        t = np.arange(n, dtype=float)
+    fix = np.isfinite(P0).all(axis=1)
+    info = dict(mode=mode, n=n, n_nofix=int((~fix).sum()), n_hdop=0, n_jump=0,
+                n_replaced=0, max_shift=0.0, bt_used=False, note="",
+                src=np.full(n, POS_GGA, dtype=int), gga_ok=fix.copy())
+    if mode == "off":
+        return P0, info
+    ok = hdop_filter(hdop, fix, hdop_max, hdop_change) if hdop is not None \
+        and np.size(hdop) == n else fix.copy()
+    info["n_hdop"] = int((fix & ~ok).sum())
+    v = None
+    if mode == "bt":
+        v, _vok = bt_boat_velocity(bt_vel, n)
+    Pbt = None
+    if v is not None:
+        dt = ensemble_dt(t)
+        Pbt = np.cumsum(v * dt[:, None], axis=0)
+        if ok.sum() >= 3 and bt_tol is not None and bt_tol > 0:
+            ok2, _ = _robust_offset_model(t, P0 - Pbt, ok, bt_window, bt_tol)
+            info["n_jump"] = int((ok & ~ok2).sum())
+            ok = ok2
+        info["bt_used"] = True
+    info["gga_ok"] = ok
+    bad = ~ok
+    if not bad.any():
+        return P0, info
+    if ok.sum() == 0:
+        info["note"] = "sin ninguna posición GGA válida: se conservan las originales"
+        info["src"][:] = POS_RAW
+        return P0, info
+    P = P0.copy()
+    src = info["src"]
+    anchors = np.where(ok)[0]
+    i = 0
+    while i < n:
+        if ok[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not ok[j]:
+            j += 1
+        a = i - 1 if i > 0 else None          # last valid before the gap
+        b = j if j < n else None              # first valid after the gap
+        idx = np.arange(i, j)
+        if Pbt is not None:
+            if a is not None and b is not None:
+                clos = (P0[b] - P0[a]) - (Pbt[b] - Pbt[a])
+                f = ((t[idx] - t[a]) / (t[b] - t[a]))[:, None] if t[b] > t[a] \
+                    else ((idx - a) / (b - a))[:, None]
+                P[idx] = P0[a] + (Pbt[idx] - Pbt[a]) + f * clos
+            elif a is not None:
+                P[idx] = P0[a] + (Pbt[idx] - Pbt[a])
+            else:
+                P[idx] = P0[b] + (Pbt[idx] - Pbt[b])
+            src[idx] = POS_BT
+        else:
+            for k in (0, 1):
+                P[idx, k] = np.interp(t[idx], t[anchors], P0[anchors, k])
+            src[idx] = POS_INTERP
+        i = j
+    info["n_replaced"] = int(bad.sum())
+    moved = bad & fix
+    if moved.any():
+        info["max_shift"] = float(np.nanmax(np.hypot(*(P[moved] - P0[moved]).T)))
+    return P, info
+
+
+def fold_back(s, step, sel_code=3.0):
+    """Largest backward excursion [m] of s along the direction of travel, over
+    the in-transect ensembles (Step 3; all when Step is absent)."""
+    s = np.asarray(s, dtype=float)
+    k = np.asarray(step) == sel_code if step is not None else np.ones(s.size, bool)
+    k &= np.isfinite(s)
+    if k.sum() < 3:
+        return 0.0
+    x = s[k]
+    sgn = 1.0 if x[-1] >= x[0] else -1.0
+    prog = sgn * (x - x[0])
+    return float(np.max(np.maximum.accumulate(prog) - prog))
+
+
+def edge_drift(s, off, step):
+    """Movement of the boat while it was supposed to sit still at a bank:
+    for the edge ensembles of each bank (step code 2 = start, 4 = end), the
+    spread of their positions ACROSS the section line (perpendicular offset)
+    and ALONG it, in the section frame. The obliquity of the crossing itself
+    does not enter: only how far the edge ensembles are from each other."""
+    out = {}
+    if step is None:
+        return out
+    st = np.asarray(step)
+    for code in (2.0, 4.0):
+        k = (st == code) & np.isfinite(s) & np.isfinite(off)
+        if k.sum() == 0:
+            continue
+        out[int(code)] = dict(n=int(k.sum()), off_max=float(np.ptp(off[k])),
+                              s_span=float(np.ptp(s[k])))
+    return out
+
+
+def screen_positions(data: dict, utm: np.ndarray, args, log: list | None = None,
+                     label: str = ""):
+    """6.7: run resolve_boat_positions with the run's settings and log it.
+    Returns (utm, info); `utm` is unchanged when nothing is invalid."""
+    mode = str(getattr(args, "position_fill", "bt") or "bt")
+    bt_vel = data.get("bt_vel")
+    cs = data.get("coord_sys")
+    if mode == "bt" and cs is not None and int(round(cs)) != 2:
+        if log is not None:
+            log.append(f"[warn] posiciones{label}: BT_Vel no está en ENU "
+                       f"(Setup.coordinateSystem={cs:g}); relleno por interpolación "
+                       "en el tiempo en vez de bottom track")
+        mode = "interp"
+    P, info = resolve_boat_positions(
+        utm, data.get("hdop"), bt_vel, data.get("time"), mode=mode,
+        hdop_max=getattr(args, "gga_hdop_max", GGA_HDOP_MAX_DEFAULT),
+        hdop_change=getattr(args, "gga_hdop_change", GGA_HDOP_CHANGE_DEFAULT),
+        bt_tol=getattr(args, "gga_bt_tol", GGA_BT_TOL_DEFAULT),
+        bt_window=getattr(args, "gga_bt_window", GGA_BT_WINDOW_DEFAULT))
+    if mode == "bt" and not info["bt_used"] and info["n_replaced"] and log is not None:
+        # resolve_boat_positions already fell back to interpolation in time
+        log.append(f"[warn] posiciones{label}: bottom track inutilizable; "
+                   "relleno por interpolación en el tiempo")
+    q = data.get("gga_quality")
+    if q is not None and np.isfinite(q).any():
+        vals, cnt = np.unique(q[np.isfinite(q)].astype(int), return_counts=True)
+        info["quality"] = " ".join(f"{v}:{c}" for v, c in zip(vals, cnt))
+    else:
+        info["quality"] = ""
+    if log is None:
+        return P, info
+    h = data.get("hdop")
+    hs = (f"HDOP {np.nanmin(h):.1f}/{np.nanmedian(h):.1f}/{np.nanmax(h):.1f} "
+          "(mín/med/máx)") if h is not None and np.isfinite(h).any() else "sin HDOP"
+    ns = data.get("n_sats")
+    ss = (f", satélites {int(np.nanmin(ns))}-{int(np.nanmax(ns))}"
+          if ns is not None and np.isfinite(ns).any() else "")
+    log.append(f"[info] GNSS{label}: calidad GGA {info['quality'] or '?'} "
+               f"(1 autónomo, 2 diferencial, 4 RTK); {hs}{ss}; relleno={info['mode']}")
+    if mode == "off":
+        log.append(f"[info] posiciones{label}: filtro GNSS APAGADO (position-fill = off, "
+                   "v6.6)")
+    elif info["n_replaced"]:
+        tag = "[warn]" if info["max_shift"] > 1.0 or info["n_replaced"] > 0.5 * info["n"] \
+            else "[info]"
+        src = POS_SRC_NAMES.get(POS_BT if info["bt_used"] else POS_INTERP)
+        log.append(f"{tag} posiciones{label}: {info['n_replaced']}/{info['n']} ensambles "
+                   f"reconstruidos ({src}) — {info['n_hdop']} por HDOP, "
+                   f"{info['n_jump']} por salto GGA-BT > "
+                   f"{float(getattr(args, 'gga_bt_tol', GGA_BT_TOL_DEFAULT)):.1f} m, "
+                   f"{info['n_nofix']} sin fix; corrimiento máx "
+                   f"{info['max_shift']:.2f} m")
+        if info["n_replaced"] > 0.5 * info["n"]:
+            log.append(f"[warn] posiciones{label}: más de la mitad de la traza sin GGA "
+                       "válido — georreferencia apoyada en pocos puntos")
+    else:
+        log.append(f"[info] posiciones{label}: GGA válido en todos los ensambles, "
+                   "sin cambios")
+    if info.get("note"):
+        log.append(f"[warn] posiciones{label}: {info['note']}")
+    return P, info
+
+
+def track_section_qa(s_track, off_track, step, args, log, s_raw=None):
+    """6.7: fold-back of s over the crossing and drift of the edge ensembles,
+    both measured on the section the profile is built on. Returns a dict for
+    the survey index; [warn] lines go to `log`."""
+    s_track = np.asarray(s_track, dtype=float)
+    off_track = np.asarray(off_track, dtype=float)
+    fold = fold_back(s_track, step)
+    tol_f = float(getattr(args, "s_fold_tol", S_FOLD_TOL_DEFAULT))
+    raw_txt = ""
+    if s_raw is not None:
+        fr = fold_back(np.asarray(s_raw, dtype=float), step)
+        if abs(fr - fold) > 0.01:
+            raw_txt = f" (GGA sin filtrar: {fr:.2f} m)"
+    tag = "WARN" if fold > tol_f else "PASS"
+    log.append(f"[QA] retroceso de s en el cruce: {fold:.2f} m{raw_txt} "
+               f"(tol {tol_f:.1f} m) {tag}")
+    if fold > tol_f:
+        log.append(f"[warn] la traza retrocede {fold:.2f} m a lo largo de la sección "
+                   "durante el cruce: puede haber dos profundidades en el mismo s")
+    tol_e = float(getattr(args, "edge_drift_tol", EDGE_DRIFT_TOL_DEFAULT))
+    drift = edge_drift(s_track, off_track, step)
+    worst = 0.0
+    for code, d in sorted(drift.items()):
+        name = "inicial" if code == 2 else "final"
+        worst = max(worst, d["off_max"], d["s_span"])
+        bad = d["off_max"] > tol_e or d["s_span"] > tol_e
+        log.append(f"[QA] deriva en el borde {name} ({d['n']} ens.): "
+                   f"{d['off_max']:.1f} m transversal a la sección, {d['s_span']:.1f} m "
+                   f"a lo largo (tol {tol_e:.1f} m) {'WARN' if bad else 'PASS'}")
+        if bad:
+            log.append(f"[warn] borde {name}: el bote derivó durante la medición de borde "
+                       f"({d['off_max']:.1f} m fuera de la línea de sección, "
+                       f"{d['s_span']:.1f} m a lo largo); "
+                       + ("los retornos lejos de la línea son de otro fondo y el "
+                          "ajuste los descarta por distancia perpendicular"
+                          if d["off_max"] > tol_e else
+                          "entran al ajuste en el s donde estuvo el bote"))
+    return dict(s_fold=fold, edge_drift=worst if drift else float("nan"))
 
 
 def resolve_beam_layout(data, args, log=None):
@@ -4599,7 +4982,8 @@ def plot_plan_view(outdir: Path, perfil_id: str, progresiva_m,
                     utm: np.ndarray, cloud: dict,
                     axis_origin: tuple[float, float], theta_section: float,
                     s_grid_extent: tuple[float, float],
-                    theta_flow: float, brazo: str = ""):
+                    theta_flow: float, brazo: str = "",
+                    utm_gga: np.ndarray | None = None, pos_src=None):
     """
     Plan view with:
         - boat track (orange)
@@ -4623,9 +5007,30 @@ def plot_plan_view(outdir: Path, perfil_id: str, progresiva_m,
     ax.scatter(cloud["E"][m_vb],   cloud["N"][m_vb],   s=8, c="black",
                alpha=0.65, label="VB (500 kHz)")
 
+    # --- 6.7: recorded GGA where the screening rebuilt positions -----------
+    rebuilt = None
+    if utm_gga is not None and pos_src is not None:
+        rebuilt = np.asarray(pos_src) != 0
+        if rebuilt.any():
+            ax.plot(utm_gga[:, 0], utm_gga[:, 1], "--", color="0.55", lw=1.0,
+                    label="GGA registrado (sin filtrar)")
+            ax.plot(utm_gga[rebuilt, 0], utm_gga[rebuilt, 1], "x", ms=5,
+                    color="0.45", label="GGA descartado")
+            for k in np.where(rebuilt)[0]:
+                if np.isfinite(utm_gga[k]).all():
+                    ax.plot([utm_gga[k, 0], utm[k, 0]], [utm_gga[k, 1], utm[k, 1]],
+                            "-", color="0.7", lw=0.6)
+        else:
+            rebuilt = None
+
     # --- boat track --------------------------------------------------------
     ax.plot(utm[:, 0], utm[:, 1], "-", color="tab:orange", lw=1.5,
             label="Trayectoria del bote")
+    if rebuilt is not None:
+        ax.plot(utm[rebuilt, 0], utm[rebuilt, 1], "o", ms=5, color="tab:purple",
+                label="Posición reconstruida ("
+                      + ("bottom track" if np.any(np.asarray(pos_src) == POS_BT)
+                         else "interpolada") + ")")
     ax.plot(utm[:, 0], utm[:, 1], "o", ms=3, color="tab:orange", alpha=0.7)
     ax.plot(utm[0, 0], utm[0, 1], "^", ms=10, color="tab:orange",
             markeredgecolor="black", label="Inicio de trayectoria")
@@ -4667,8 +5072,10 @@ def plot_plan_view(outdir: Path, perfil_id: str, progresiva_m,
 
     # Lock axis limits to the data extent (with a small pad).
     pad = 0.08 * track_extent + 1.0
-    all_E = np.concatenate([utm[:, 0], cloud["E"], [Ea, Eb, hE]])
-    all_N = np.concatenate([utm[:, 1], cloud["N"], [Na, Nb, hN]])
+    all_E = np.concatenate([utm[:, 0], cloud["E"], [Ea, Eb, hE]]
+                           + ([utm_gga[:, 0]] if rebuilt is not None else []))
+    all_N = np.concatenate([utm[:, 1], cloud["N"], [Na, Nb, hN]]
+                           + ([utm_gga[:, 1]] if rebuilt is not None else []))
     ax.set_xlim(np.nanmin(all_E) - pad, np.nanmax(all_E) + pad)
     ax.set_ylim(np.nanmin(all_N) - pad, np.nanmax(all_N) + pad)
 
@@ -5265,6 +5672,9 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         Ex, Ny = tr.transform(data["lon"], data["lat"])
         utm = np.column_stack([Ex, Ny])
         log.append("[info] derived UTM from Lat/Lon")
+    # 6.7: HDOP + GGA/bottom-track screening; invalid fixes rebuilt from BT
+    utm_gga = utm.copy()
+    utm, pos_info = screen_positions(data, utm, args, log)
     utm = apply_gnss_lag(utm, data["time"], getattr(args, "gnss_lag", 0.0), log)
     utm = apply_antenna_offset(utm, data["heading"], getattr(args, "antenna_offset", None), log)
 
@@ -5308,13 +5718,17 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
     # ------------------------------------------------------------ STEP 4
     centroid = (float(np.nanmean(utm[:, 0])), float(np.nanmean(utm[:, 1])))
     s_pts_TL, d_off_TL = project_to_axis(cloud["E"], cloud["N"], centroid, theta_section)
-    s_track_TL, _      = project_to_axis(utm[:, 0], utm[:, 1], centroid, theta_section)
+    s_track_TL, off_track = project_to_axis(utm[:, 0], utm[:, 1], centroid, theta_section)
     s_pts   = -s_pts_TL
     s_track = -s_track_TL
     ux_LR = -math.cos(theta_section)
     uy_LR = -math.sin(theta_section)
     s_data_min = float(np.nanmin(s_pts))
     s_data_max = float(np.nanmax(s_pts))
+    # 6.7: QA of the track against the section — fold-back and edge drift
+    track_qa = track_section_qa(s_track, off_track, data.get("step"), args, log,
+                                s_raw=-project_to_axis(utm_gga[:, 0], utm_gga[:, 1],
+                                                       centroid, theta_section)[0])
 
     edge_l = data["edge_left"]  if not args.no_edge_extrapolation else 0.0
     edge_r = data["edge_right"] if not args.no_edge_extrapolation else 0.0
@@ -5535,7 +5949,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
     plot1 = plot_plan_view(outdir, perfil_id, progresiva_m, utm, cloud,
                            axis_origin, theta_section_final,
                            (float(s_grid[0]), float(s_grid[-1])),
-                           theta_flow=theta_flow, brazo=brazo)
+                           theta_flow=theta_flow, brazo=brazo,
+                           utm_gga=utm_gga, pos_src=pos_info["src"])
     plot2 = plot_cross_section(outdir, perfil_id, progresiva_m,
                                s_pts_final, cloud["depth"], cloud["beam_index"],
                                s_grid, depth_grid,
@@ -5633,6 +6048,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         # 6.4
         edge_methods=(data.get("edge_method_left"), data.get("edge_method_right")),
         edge_shapes=(shape_l, shape_r), bed_fit=args.bed_fit, bed_meta=bed_meta,
+        # 6.7
+        pos_info=pos_info, track_qa=track_qa,
     )
 
 
@@ -5771,6 +6188,11 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
     log: list[str] = [f"[info] GRUPO {gid}: {len(group)} repeticiones promediadas",
                       f"[info] miembros: {', '.join(r['perfil'] for r in group)}",
                       f"[info] outdir : {outdir}"]
+    for r in group:                                          # 6.7
+        pi = r.get("pos_info") or {}
+        if pi.get("n_replaced"):
+            log.append(f"[info] {r['perfil']}: {pi['n_replaced']}/{pi['n']} posiciones "
+                       f"reconstruidas (corrimiento máx {pi['max_shift']:.2f} m)")
 
     # ---- group axis: pooled unit-discharge direction of all in-transect ens.
     theta_flow, theta_section = group_flow_direction(group, args, log)
@@ -6048,7 +6470,39 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         composite=ref.get("composite", True), orient_qc=ref.get("orient_qc", {}),
         # 6.4
         edge_shapes=(shape_l, shape_r), bed_fit=args.bed_fit, bed_meta=bed_meta,
+        # 6.7: members' GNSS screening and track QA, pooled
+        pos_info=_pool_pos_info(group), track_qa=_pool_track_qa(group),
     )
+
+
+def _pool_pos_info(results):
+    """6.7: GNSS-screening counts of several transects summed (max for the
+    shift), for a group row of the survey index."""
+    infos = [r.get("pos_info") for r in results if r.get("pos_info")]
+    if not infos:
+        return None
+    out = dict(n=sum(i["n"] for i in infos), n_hdop=sum(i["n_hdop"] for i in infos),
+               n_jump=sum(i["n_jump"] for i in infos),
+               n_replaced=sum(i["n_replaced"] for i in infos),
+               n_nofix=sum(i["n_nofix"] for i in infos),
+               max_shift=max(i["max_shift"] for i in infos))
+    qs = {}
+    for i in infos:
+        for tok in str(i.get("quality", "")).split():
+            k, _, v = tok.partition(":")
+            qs[k] = qs.get(k, 0) + int(v or 0)
+    out["quality"] = " ".join(f"{k}:{v}" for k, v in sorted(qs.items()))
+    return out
+
+
+def _pool_track_qa(results):
+    """6.7: worst fold-back and edge drift among the members."""
+    qa = [r.get("track_qa") for r in results if r.get("track_qa")]
+    if not qa:
+        return None
+    return dict(s_fold=max(q["s_fold"] for q in qa),
+                edge_drift=float(np.nanmax([q["edge_drift"] for q in qa]))
+                if any(np.isfinite(q["edge_drift"]) for q in qa) else float("nan"))
 
 
 # ============================================================================ #
@@ -6072,11 +6526,22 @@ def _sort_key(r):
             float("inf") if x is None else float(x))
 
 
+def _pos_cols(r, _f):
+    """6.7: GNSS-screening and track-QA columns of the survey index."""
+    pi = r.get("pos_info") or {}
+    qa = r.get("track_qa") or {}
+    return [pi.get("quality", ""),
+            pi.get("n_hdop", ""), pi.get("n_jump", ""), pi.get("n_replaced", ""),
+            _f(pi.get("max_shift"), "{:.2f}"),
+            _f(qa.get("s_fold"), "{:.2f}"), _f(qa.get("edge_drift"), "{:.1f}")]
+
+
 def write_survey_index(results, resumen_dir: Path, datum_name: str):
     """One row per transect: river, official km, brazo, cotas, ancho, WS source.
     6.1: written with the csv module (notes may contain commas); `recorrido`
     and `loc_method` appended at the end so existing column positions hold.
-    6.4: `forma_mi`, `forma_md` (bank shape used) and `bed_fit` appended too."""
+    6.4: `forma_mi`, `forma_md` (bank shape used) and `bed_fit` appended too.
+    6.7: GNSS screening (gga_q, pos_*) and track QA (s_fold_m, edge_drift_m)."""
     path = resumen_dir / "survey_index.csv"
     rs = sorted(results, key=_sort_key)
 
@@ -6090,7 +6555,9 @@ def write_survey_index(results, resumen_dir: Path, datum_name: str):
                     "survey_chainage_m", "ws_elev_m", "ws_source", "thalweg_elev_m",
                     "max_depth_m", "width_m", "n_samples", "dist_axis_m",
                     "theta_flow_deg", "ws_note", "q_m3s", "recorrido", "loc_method",
-                    "forma_mi", "forma_md", "bed_fit"])
+                    "forma_mi", "forma_md", "bed_fit",
+                    "gga_q", "pos_hdop", "pos_jump", "pos_rebuilt",
+                    "pos_shift_max_m", "s_fold_m", "edge_drift_m"])
         for r in rs:
             kmo = r.get("km_oficial")
             absolute = r["ws_elev"] is not None
@@ -6104,7 +6571,8 @@ def write_survey_index(results, resumen_dir: Path, datum_name: str):
                 _f(r["dist_axis"], "{:.1f}"), f"{math.degrees(r['theta_flow']):.1f}",
                 r["ws_note"], _f(r.get("q_total"), "{:.3f}"),
                 r.get("recorrido", ""), r.get("loc_method", ""),
-                *(r.get("edge_shapes") or ("", "")), r.get("bed_fit", "")])
+                *(r.get("edge_shapes") or ("", "")), r.get("bed_fit", ""),
+                *_pos_cols(r, _f)])
     return path
 
 
@@ -7009,6 +7477,10 @@ def process_track(matpath: Path, args, network=None, wsm=None, out_crs=None,
         tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
         ex, ny = tr.transform(data["lon"], data["lat"])
         utm = np.column_stack([ex, ny])
+    # 6.7: same GNSS screening as the transects; only its warnings are logged
+    _plog: list[str] = []
+    utm, _pinfo = screen_positions(data, utm, args, _plog, label=f" recorrido {stem}")
+    log.extend(x for x in _plog if x.startswith("[warn]"))
     utm = apply_gnss_lag(utm, data["time"], getattr(args, "gnss_lag", 0.0))
     utm = apply_antenna_offset(utm, data["heading"], getattr(args, "antenna_offset", None))
 
@@ -7225,6 +7697,8 @@ def process_track(matpath: Path, args, network=None, wsm=None, out_crs=None,
         off_axis=np.asarray(off_pt, dtype=float),
         dist_axis=np.asarray(dist_pt, dtype=float),
         t_utc=t_pt,
+        pos_rebuilt=int(_pinfo["n_replaced"]),                     # 6.7
+        pos_shift_max=float(_pinfo["max_shift"]),
     )
 
 
@@ -7319,7 +7793,8 @@ def write_tracks_index(tracks, resumen_dir: Path):
         w = csv.writer(f)
         w.writerow(["archivo", "clase", "origen_clase", "n_ensambles", "n_sin_fix",
                     "n_puntos", "rios", "km_inicio", "km_fin", "largo_traza_m",
-                    "inicio", "duracion_min", "ws_source", "avisos"])
+                    "inicio", "duracion_min", "ws_source", "avisos",
+                    "pos_reconstruidas", "pos_corrimiento_max_m"])
         for t in sorted(tracks, key=lambda q: (q["rivers"][:1], q["km_min"]
                                                if np.isfinite(q["km_min"]) else 0.0)):
             w.writerow([
@@ -7332,6 +7807,8 @@ def write_tracks_index(tracks, resumen_dir: Path):
                 "" if not np.isfinite(t["dur_min"]) else f"{t['dur_min']:.1f}",
                 ", ".join(f"{k} {v}" for k, v in sorted(t["ws_tally"].items())),
                 "; ".join(t["warn"]),
+                t.get("pos_rebuilt", ""),
+                "" if t.get("pos_shift_max") is None else f"{t['pos_shift_max']:.2f}",
             ])
     return path
 
@@ -7443,6 +7920,21 @@ def prescan_transects(matfiles, network, args=None, log: list | None = None):
             # 6.2: same GNSS-dropout mask as process_one, so the pre-scan places
             # the transect from the same positions the run will use
             lat, lon, utm, _n = _mask_gnss_dropouts(lat, lon, utm)
+            # 6.7: the pre-scan has no bottom track at hand: only the HDOP
+            # filter, and the rejected fixes are simply left out
+            hd = get_field(gps, "HDOP")
+            if (args is not None and getattr(args, "position_fill", "bt") != "off"
+                    and hd is not None and np.size(hd) == lat.size):
+                fx = np.isfinite(lat) & np.isfinite(lon)
+                okh = hdop_filter(np.asarray(hd, dtype=float).ravel(), fx,
+                                  getattr(args, "gga_hdop_max", GGA_HDOP_MAX_DEFAULT),
+                                  getattr(args, "gga_hdop_change",
+                                          GGA_HDOP_CHANGE_DEFAULT))
+                if okh.sum() >= 2:
+                    lat = np.where(okh, lat, np.nan)
+                    lon = np.where(okh, lon, np.nan)
+                    if utm is not None and np.ndim(utm) == 2:
+                        utm = np.where(okh[:, None], utm, np.nan)
             utm_crs = auto_utm_crs(lat, lon)
             if utm is None or utm.ndim != 2 or not np.isfinite(utm).any():
                 tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
@@ -8119,6 +8611,35 @@ def build_parser():
                         "which a transect is not processed (default 0.30).")
     p.add_argument("--allow-gps-gaps", action="store_true",
                    help="6.2: process a transect anyway, past --gps-max-gap.")
+    # --- 6.7: GNSS screening of the boat track ---
+    p.add_argument("--position-fill", choices=["bt", "interp", "off"], default="bt",
+                   help="6.7: what replaces a GGA fix rejected by the HDOP or the "
+                        "GGA-BT consistency filter: 'bt' (default) the bottom-track "
+                        "increments between the valid fixes on either side; 'interp' "
+                        "linear interpolation in time; 'off' no filter at all (v6.6). "
+                        "Valid fixes are never modified.")
+    p.add_argument("--gga-hdop-max", type=float, default=GGA_HDOP_MAX_DEFAULT,
+                   help=f"6.7: GGA fixes with HDOP above this are invalid "
+                        f"(default {GGA_HDOP_MAX_DEFAULT:g}, QRev; 0 = off).")
+    p.add_argument("--gga-hdop-change", type=float, default=GGA_HDOP_CHANGE_DEFAULT,
+                   help=f"6.7: then, fixes whose HDOP departs from the mean of the "
+                        f"valid ones by more than this are invalid (default "
+                        f"{GGA_HDOP_CHANGE_DEFAULT:g}; 0 = off).")
+    p.add_argument("--gga-bt-tol", type=float, default=GGA_BT_TOL_DEFAULT,
+                   help=f"6.7: a GGA fix farther than this [m] from the local trend "
+                        f"of GGA minus the bottom-track track is a jump and is "
+                        f"rebuilt (default {GGA_BT_TOL_DEFAULT:g}).")
+    p.add_argument("--gga-bt-window", type=float, default=GGA_BT_WINDOW_DEFAULT,
+                   help=f"6.7: half-window [s] of that local linear trend "
+                        f"(default {GGA_BT_WINDOW_DEFAULT:g}).")
+    p.add_argument("--s-fold-tol", type=float, default=S_FOLD_TOL_DEFAULT,
+                   help=f"6.7: QA — warn when s moves backwards more than this [m] "
+                        f"during the crossing (default {S_FOLD_TOL_DEFAULT:g}).")
+    p.add_argument("--edge-drift-tol", type=float, default=EDGE_DRIFT_TOL_DEFAULT,
+                   help=f"6.7: QA — warn when the edge ensembles of a bank (Step "
+                        f"2/4, boat meant to be still) spread more than this [m] "
+                        f"across or along the section line (default "
+                        f"{EDGE_DRIFT_TOL_DEFAULT:g}).")
     p.add_argument("--time-epoch", default="auto",
                    choices=["auto", "sontek", "unix", "datenum"],
                    help="6.2: encoding of System.Time. The ranges overlap, so "
