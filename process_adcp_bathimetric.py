@@ -2,12 +2,82 @@
 """
 process_adcp_bathimetric.py
 ================================================================================
-ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.6)
+ADCP CROSS-SECTION EXTRACTION — Bathymetry-only pipeline (v6.8)
 
 Builds a hydraulically consistent 1D bathymetric cross-section perpendicular
 to the mean flow, from a SonTek M9/S5 .mat file (RiverSurveyor Live export).
 
 Velocities are NOT exported. Only the bed profile and supporting QA artifacts.
+
+Changes in 6.8:
+    * MANUAL DISCARDS, INI section [descartes]. A depth source can be dropped
+      for a whole transect or for part of it, and the composite fill then
+      takes the secondary source there, exactly as QRev does for a missing
+      primary depth. Motivation: 20260825153036 (Río Negro 2+018), where the
+      vertical beam caught a snag 2.5-3.7 m above the bed (VB 1.50-2.73 m
+      against 4.3-5.3 m on the slant beams, bottom lost on the two ensembles
+      before) and the spike filter could not reject a 4-ensemble run on a
+      steep bank. One rule per line or comma-separated:
+          <id> = <source>[+<source>...] [<condition> <value>] ...
+      sources: vb, b1..b4, bt (the four slant beams), todos;
+      conditions (AND-ed): s (final section distance, m), ens (RSL sample
+      number, from 1), prof (beam depth, m), cota (bed elevation, m, needs a
+      water surface), dif (|VB - median of the slant beams| of the same
+      ensemble, or |beam - VB| for a slant beam, m); values A-B, <X, >X, or
+      a single number for ens. <id> is a transect id (file stem, or just its
+      14-digit timestamp) or a group id (then s is the group's axis).
+      * s is read in the frame of the run WITHOUT discards (the plot the user
+        looked at); the measured extent is then recomputed from the kept
+        points, and the log reports it if the origin of s moved.
+      * Discarded points stay in raw_bed_points.csv (new trailing columns
+        `ens` and `descarte`), are drawn as red crosses on cross_section.png,
+        and are left out of the survey beam cloud. survey_index.csv gets a
+        trailing `descartes` column (count of discarded points).
+      * A bad rule stops the run at start-up; a rule that matches no point
+        is a [warn].
+    * cross_section.png subtitle with decimal point (was comma).
+
+Changes in 6.7:
+    * GNSS SCREENING OF THE BOAT TRACK (position-fill = bt, default). v6.6
+      used GPS.UTM as recorded. The M9's internal receiver is mostly
+      autonomous (GGA quality 1): its ~2 m bias is harmless while HDOP and the
+      constellation are stable, but when a satellite enters or leaves the fix
+      jumps several metres ALONG the section, s is stretched or folded, and
+      the perpendicular-offset penalty cannot see it (campaign 2026-04-15,
+      20260415122618: HDOP 22.6 at the start edge and 16.5 mid-crossing, edge
+      ensembles placed 10 m into the channel, bed saw-toothed). Now:
+        - HDOP filter as QRev: HDOP > gga-hdop-max (4) invalid, then HDOP
+          farther than gga-hdop-change (2) from the mean of the valid ones.
+        - GGA-BT consistency: GGA - (integrated bottom-track track) is a slow
+          offset (receiver bias, compass misalignment, moving bed); a fix
+          more than gga-bt-tol (1.5 m) off its local linear trend over
+          +-gga-bt-window (30 s) is a jump even with a normal HDOP.
+        - Each invalid position is rebuilt from the bottom-track increments
+          between the valid fixes on either side, closure spread linearly in
+          time (traverse adjustment); open ends hang from the nearest valid
+          fix. position-fill = interp interpolates in time instead (no BT),
+          off reproduces v6.6 exactly.
+        - VALID GGA POSITIONS ARE NOT TOUCHED: a clean transect gives the same
+          profile, byte for byte, as in v6.6.
+      GGA quality is NOT filtered (QRev's default >= 2 would reject nearly the
+      whole campaign); it is reported.
+      Applied to transects, tracks (recorridos) and the location pre-scan
+      (HDOP only there).
+    * QA: s FOLD-BACK — largest backward excursion of s along the direction
+      of travel over the Step 3 ensembles, with the final positions;
+      [warn] above s-fold-tol (2 m). A boat backing over the same bed is
+      harmless; a large fold means two depths at the same s.
+    * QA: EDGE DRIFT — the edge ensembles of a bank (Step 2/4) spread more
+      than edge-drift-tol (5 m) across or along the section line: the boat
+      drifted while "stationary" at the bank and measured another bed
+      (20260415131650: 21 m across the line during the start edge). Warned
+      only; the offset penalty already removes the far returns from the fit.
+    * GNSS dropouts (0/0) are no longer dropped from the cloud: they are
+      rebuilt from bottom track like any other invalid fix (gps-max-gap still
+      rejects a transect with too many).
+    * plan_view_map.png shows the recorded GGA track (grey) and the rebuilt
+      positions; survey_index.csv appends gga_q, pos_hdop, pos_jump,
+      pos_rebuilt, pos_shift_max_m, s_fold_m, edge_drift_m.
 
 Changes in 6.6:
     * [orientacion]: per transect or group, the section line can be forced to
@@ -337,7 +407,7 @@ except Exception as e:
 DATUM_NAME_DEFAULT = "IGN SRVN16"
 
 # Script version (reported in logs and the traceability record).
-__version__ = "6.6"
+__version__ = "6.8"
 
 # 6.1: water-surface extrapolation beyond the last value of a path (slope
 # continuation) is reported as a WARNING only past this distance [m]; shorter
@@ -525,6 +595,21 @@ def extract_data(mat: dict) -> dict:
     # faja 2 -> faja 7). Invalidated here, once, before anything else reads it.
     lat, lon, utm, n_nofix = _mask_gnss_dropouts(lat, lon, utm)
 
+    # 6.7: what the GNSS screening needs — HDOP / quality / satellites of each
+    # GGA fix and the bottom-track boat velocity (ENU when coordinateSystem = 2)
+    def _gps_vec(name):
+        v = get_field(gps, name)
+        if v is None:
+            return None
+        v = np.asarray(v, dtype=float).ravel()
+        return v if v.size == len(vb_depth) else None
+    hdop = _gps_vec("HDOP")
+    gga_quality = _gps_vec("GPS_Quality")
+    n_sats = _gps_vec("Satellites")
+    bt_vel = get_field(bt, "BT_Vel")
+    bt_vel = np.asarray(bt_vel, dtype=float) if bt_vel is not None else None
+    coord_sys = _opt_scalar(get_field(setp, "coordinateSystem"))
+
     heading    = np.asarray(
         get_field(sysd, "True_North_ADP_Heading",
                   default=get_field(sysd, "Heading")),
@@ -557,6 +642,14 @@ def extract_data(mat: dict) -> dict:
     _step = get_field(sysd, "Step", default=None)
     step = (np.asarray(_step, dtype=float) if _step is not None
             else np.full(len(vb_depth), 3.0))
+    # 6.8: RSL sample number (System.Sample, from 1) — what [descartes] `ens`
+    # refers to. Row index + 1 when the field is missing or inconsistent.
+    _smp = get_field(sysd, "Sample", default=None)
+    sample = np.arange(1, len(vb_depth) + 1, dtype=int)
+    if _smp is not None:
+        _smp = np.asarray(_smp, dtype=float).ravel()
+        if _smp.size == len(vb_depth) and np.all(np.isfinite(_smp)):
+            sample = _smp.astype(int)
 
     # v6: Summary.Depth is the reference depth RiverSurveyor itself used.
     summary_depth = get_field(summ, "Depth")
@@ -611,11 +704,13 @@ def extract_data(mat: dict) -> dict:
         lat=lat, lon=lon, n_nofix=int(n_nofix),
         heading=heading, pitch=pitch, roll=roll, attitude_src=attitude_src,
         beam_layout=beam_layout, beam_layout_note=layout_note,
-        time=time, step=step,
+        time=time, step=step, sample=sample,
         mean_vel=mean_vel,
         edge_left=edge_left, edge_right=edge_right, start_edge=start_edge,
         edge_method_left=edge_method_left, edge_method_right=edge_method_right,
         sensor_depth=sensor_depth, depth_reference=depth_reference,
+        hdop=hdop, gga_quality=gga_quality, n_sats=n_sats,
+        bt_vel=bt_vel, coord_sys=coord_sys,
     )
 
 
@@ -992,7 +1087,11 @@ def merge_group_clouds(group):
     from 0.046 m (mean of the individual profiles) to 0.028 m.
     """
     keys = ("E", "N", "depth", "weight", "beam_index", "beam_freq_khz",
-            "ens", "src", "primary")
+            "ens", "src", "primary", "sample", "keep", "descarte")
+    # 6.8: keep / descarte carry each member's [descartes] into the group
+    _dflt = {"sample": lambda c: np.asarray(c["ens"], dtype=int) + 1,
+             "keep": lambda c: np.ones(len(np.asarray(c["E"])), dtype=bool),
+             "descarte": lambda c: np.full(len(np.asarray(c["E"])), "", dtype=object)}
     # 6.2: every repetition is brought into the REFERENCE member's UTM zone
     # first. v6.1 concatenated E/N raw: an aforo whose repetitions straddled
     # lon -66 mixed zones 19S and 20S, a 517 km offset, silently. The tracks
@@ -1009,7 +1108,8 @@ def merge_group_clouds(group):
         for r in group:
             if not r.get("cloud"):
                 continue
-            v = np.asarray(r["cloud"][k])
+            v = np.asarray(r["cloud"][k] if k in r["cloud"]
+                           else _dflt[k](r["cloud"]))
             if k in ("E", "N") and ref_crs is not None \
                     and CRS.from_user_input(r["utm_crs"]) != CRS.from_user_input(ref_crs):
                 tr = Transformer.from_crs(r["utm_crs"], ref_crs, always_xy=True)
@@ -1633,6 +1733,275 @@ def filter_cloud_depths(data: dict, enabled: bool = True,
 
 
 # ============================================================================ #
+#  6.8 — MANUAL DISCARDS  ([descartes])
+# ============================================================================ #
+# The spike filter above works on each beam's time series and cannot reject a
+# run of several ensembles on a steep bank (the running IQR is large there).
+# [descartes] lets the operator drop a depth source where it is known to be
+# wrong; the composite fill then takes the secondary source, as in QRev.
+
+_DISCARD_SECTIONS = ["descartes", "descarte", "exclusiones", "discards"]
+_DISC_KINDS = {"s": "s", "ens": "ens", "ensamble": "ens", "ensambles": "ens",
+               "muestra": "ens", "sample": "ens",
+               "prof": "prof", "profundidad": "prof", "depth": "prof",
+               "cota": "cota", "elev": "cota",
+               "dif": "dif", "diferencia": "dif"}
+_DISC_KIND_TXT = {"s": "s", "ens": "ens", "prof": "prof", "cota": "cota", "dif": "dif"}
+_NUM = r"\d+(?:\.\d+)?"
+
+
+def _disc_beams():
+    """Source token -> set of beam_index values (built lazily: BEAM_BT_ENS is
+    defined further down)."""
+    slant = {1, 2, 3, 4, BEAM_BT_ENS}
+    return {"vb": {0}, "b1": {1}, "b2": {2}, "b3": {3}, "b4": {4},
+            "bt": slant, "inclinados": slant, "laterales": slant,
+            "todos": {0} | slant, "all": {0} | slant}
+
+
+def _parse_disc_value(tok, kind):
+    """'A-B' | '<X' | '>X' | 'X' (ens only) -> (lo, hi), inclusive."""
+    t = tok.strip()
+    m = re.fullmatch(rf"([<>])=?({_NUM})", t)
+    if m:
+        v = float(m.group(2))
+        return (-np.inf, v) if m.group(1) == "<" else (v, np.inf)
+    m = re.fullmatch(rf"({_NUM})-({_NUM})", t)
+    if m:
+        a, b = float(m.group(1)), float(m.group(2))
+        if b < a:
+            raise ValueError(f"rango '{t}' invertido (usar menor-mayor)")
+        return a, b
+    if re.fullmatch(_NUM, t):
+        if kind == "ens":
+            return float(t), float(t)
+        raise ValueError(f"'{kind} {t}': usar un rango A-B, <X o >X")
+    if "," in t:
+        raise ValueError(f"'{t}': el separador decimal es el punto")
+    raise ValueError(f"valor '{t}' no reconocido para '{kind}' "
+                     "(usar A-B, <X o >X)")
+
+
+def parse_discard_rule(text):
+    """One rule -> dict(text, beams, conds). Raises ValueError with a message
+    in Spanish (it is shown to the operator)."""
+    txt = re.sub(r"([<>]=?)\s+", r"\1", str(text).strip())
+    toks = txt.split()
+    if not toks:
+        raise ValueError("regla vacía")
+    beams = set()
+    table = _disc_beams()
+    for b in toks[0].lower().split("+"):
+        if b not in table:
+            hint = (" — ¿coma decimal? el separador decimal es el punto"
+                    if re.match(r"\d", b) else "")
+            raise ValueError(f"fuente '{b}' desconocida (vb, b1, b2, b3, b4, bt, "
+                             f"todos){hint}")
+        beams |= table[b]
+    conds, i = [], 1
+    while i < len(toks):
+        kind = _DISC_KINDS.get(toks[i].lower())
+        if kind is None:
+            raise ValueError(f"condición '{toks[i]}' desconocida "
+                             "(s, ens, prof, cota, dif)")
+        if i + 1 >= len(toks):
+            raise ValueError(f"falta el valor de '{toks[i]}'")
+        lo, hi = _parse_disc_value(toks[i + 1], kind)
+        if kind == "ens" and any(np.isfinite(x) and not float(x).is_integer()
+                                 for x in (lo, hi)):
+            raise ValueError(f"'ens {toks[i + 1]}': los ensambles son enteros")
+        conds.append((kind, lo, hi))
+        i += 2
+    return dict(text=" ".join(toks), beams=beams, conds=conds)
+
+
+def load_discard_rules(path):
+    """{id: [rule, ...]} from the INI [descartes] section, and a list of
+    error strings. Rules are separated by commas or line breaks."""
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    try:
+        cp.read(Path(path), encoding="utf-8")
+    except Exception as e:
+        return {}, [f"no se pudo leer el INI: {e}"]
+    sec = _find_section(cp, _DISCARD_SECTIONS)
+    out, bad = {}, []
+    if not sec:
+        return out, bad
+    for key, val in cp.items(sec):
+        if val is None or not str(val).strip():
+            continue
+        rules = []
+        for part in re.split(r"[,\n]", str(val)):
+            if not part.strip():
+                continue
+            try:
+                rules.append(parse_discard_rule(part))
+            except ValueError as e:
+                bad.append(f"{key} = {part.strip()}: {e}")
+        if rules:
+            out.setdefault(str(key).strip(), []).extend(rules)
+    return out, bad
+
+
+def _id_key_matches(key, ident):
+    """[descartes] key vs a transect/group id: exact, or the 14-digit
+    timestamp of the file stem (so '20260825153036' matches '20260825153036r')."""
+    key, ident = str(key).strip(), str(ident).strip()
+    if key == ident:
+        return True
+    if re.fullmatch(r"\d{14}", key):
+        m = re.findall(r"\d{14}", ident)
+        return len(m) == 1 and m[0] == key
+    return False
+
+
+def discard_rules_for(args, ident, members=None):
+    """Rules of [descartes] whose key matches `ident`.
+
+    For a group (`members` given) only keys naming the GROUP count: its id,
+    or a [grupos] name holding any member. A key that matches a member is that
+    member's rule, already applied to its own cloud — never re-applied on the
+    group axis (a timestamp key would otherwise match '<id>_x4' too)."""
+    ov = getattr(args, "discard_rules", None) or {}
+    out = []
+    if members is None:
+        for k, rules in ov.items():
+            if _id_key_matches(k, ident):
+                out.extend(rules)
+        return out
+    mg = getattr(args, "manual_groups", None) or {}
+    for k, rules in ov.items():
+        if any(_id_key_matches(k, m) for m in members):
+            continue
+        if str(k).strip() == str(ident) or (
+                k in mg and any(_id_key_matches(x, m) for x in mg[k] for m in members)):
+            out.extend(rules)
+    return out
+
+
+def section_frame_shift(args, edge_l, ext_lo, s_pts):
+    """The shift build_profile / build_profile_loess will apply to put the left
+    bank at s = 0, from the same inputs (6.8: [descartes] reads its s ranges
+    in this frame, computed before any discard)."""
+    lo = ext_lo
+    if lo is None or not np.isfinite(lo):
+        s = np.asarray(s_pts, dtype=float)
+        lo = float(np.nanmin(s)) if np.any(np.isfinite(s)) else 0.0
+    if str(getattr(args, "bed_fit", "loess")).lower() == "median":
+        return float(edge_l or 0.0) - float(lo)
+    return max(float(edge_l or 0.0), WALL_EPS) - float(lo)
+
+
+def _fmt_rng(v):
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return "—"
+    a, b = float(v.min()), float(v.max())
+    return f"{a:.1f}" if abs(b - a) < 0.05 else f"{a:.1f}–{b:.1f}"
+
+
+def apply_discards(cloud, s_final, rules, ws_elev, log, label, allow_ens=True):
+    """6.8: evaluate [descartes] rules on a beam cloud.
+
+    `s_final` is the section distance of every point in the frame the operator
+    reads on cross_section.png. Returns (keep, why): keep is False for a
+    discarded point, why holds the text of the first rule that dropped it.
+    Conditions of one rule are AND-ed; rules are OR-ed."""
+    depth = np.asarray(cloud["depth"], dtype=float)
+    n = depth.size
+    keep = np.ones(n, dtype=bool)
+    why = np.full(n, "", dtype=object)
+    if not rules or n == 0:
+        return keep, why
+    bi = np.asarray(cloud["beam_index"], dtype=int)
+    ens = np.asarray(cloud["ens"], dtype=int)
+    smp = np.asarray(cloud.get("sample", ens + 1), dtype=float)
+    rep = np.asarray(cloud.get("rep", np.zeros(n, dtype=int)), dtype=int)
+    if rep.size != n:
+        rep = np.zeros(n, dtype=int)
+    s_final = np.asarray(s_final, dtype=float)
+
+    # dif: |VB - median(slant)| of the same ensemble, |slant - VB| for a beam
+    k_ens = rep.astype(np.int64) * 10_000_000 + ens
+    vb_of, sl_of = {}, {}
+    for i in range(n):
+        if not np.isfinite(depth[i]):
+            continue
+        if bi[i] == 0:
+            vb_of[int(k_ens[i])] = depth[i]
+        else:
+            sl_of.setdefault(int(k_ens[i]), []).append(depth[i])
+    sl_med = {k: float(np.median(v)) for k, v in sl_of.items()}
+    dif = np.full(n, np.nan)
+    for i in range(n):
+        other = (sl_med.get(int(k_ens[i])) if bi[i] == 0
+                 else vb_of.get(int(k_ens[i])))
+        if other is not None and np.isfinite(depth[i]):
+            dif[i] = abs(depth[i] - other)
+
+    names = {0: "VB", 1: "B1", 2: "B2", 3: "B3", 4: "B4", BEAM_BT_ENS: "BT"}
+    for j, rule in enumerate(rules, 1):
+        tag = f"[descartes] {label} regla {j} '{rule['text']}'"
+        m = np.isin(bi, list(rule["beams"]))
+        skip = False
+        for kind, lo, hi in rule["conds"]:
+            if kind == "s":
+                v = s_final
+            elif kind == "ens":
+                if not allow_ens:
+                    log.append(f"[warn] {tag}: 'ens' no vale para un grupo (cada "
+                               "repetición numera sus ensambles) — poner la regla "
+                               "con el id de la transecta; ignorada")
+                    skip = True
+                    break
+                v = smp
+            elif kind == "prof":
+                v = depth
+            elif kind == "cota":
+                if ws_elev is None:
+                    log.append(f"[warn] {tag}: 'cota' necesita pelo de agua y esta "
+                               "sección no tiene — ignorada")
+                    skip = True
+                    break
+                v = float(ws_elev) - depth
+            else:                                           # dif
+                v = dif
+            m &= np.isfinite(v) & (v >= lo) & (v <= hi)
+        if skip:
+            continue
+        new = m & keep
+        if not np.any(m):
+            log.append(f"[warn] {tag}: no coincide con ningún punto — revisar "
+                       "el id, la fuente y los rangos")
+            continue
+        keep &= ~m
+        why[new] = rule["text"]
+        by_b = ", ".join(f"{names.get(b, b)} {int(np.count_nonzero(new & (bi == b)))}"
+                         for b in sorted(set(bi[new].tolist())))
+        _nd = int(m.sum() - new.sum())
+        extra = "" if _nd == 0 else \
+            f" (+{_nd} ya descartado{'' if _nd == 1 else 's'} por otra regla)"
+        _nn = int(new.sum())
+        log.append(f"[info] {tag}: {_nn} punto{'' if _nn == 1 else 's'} "
+                   f"descartado{'' if _nn == 1 else 's'} ({by_b}) "
+                   f"en s = {_fmt_rng(s_final[new])} m"
+                   + (f", ens. {_fmt_rng(smp[new]).replace('.0', '')}"
+                      if allow_ens else "") + extra)
+    nd = int(np.count_nonzero(~keep))
+    if nd:
+        nvb = int(np.count_nonzero(~keep & (bi == 0)))
+        log.append(f"[info] [descartes] {label}: estas reglas dejan {nd} de {n} "
+                   f"puntos fuera del ajuste (VB {nvb}, inclinados {nd - nvb})")
+        # a node that lost ALL its points is interpolated, not measured
+        kept_vb = keep & (bi == 0)
+        if np.any(~keep & (bi == 0)) and not np.any(kept_vb):
+            log.append(f"[warn] [descartes] {label}: no queda ningún punto del VB")
+    return keep, why
+
+
+# ============================================================================ #
 #  STEP 3 — beam footprints
 # ============================================================================ #
 
@@ -1738,6 +2107,330 @@ def apply_antenna_offset(utm, heading, offset, log=None):
         log.append(f"[info] antenna-offset: transductor {fx:+.2f} m hacia proa, "
                    f"{fy:+.2f} m hacia estribor de la antena")
     return P
+
+
+# ============================================================================ #
+#  6.7 — GNSS SCREENING OF THE BOAT TRACK (HDOP + GGA/bottom-track consistency)
+# ============================================================================ #
+
+GGA_HDOP_MAX_DEFAULT = 4.0       # QRev technical manual: HDOP > 4 invalid
+GGA_HDOP_CHANGE_DEFAULT = 2.0    # |HDOP - mean of valid| above this invalid
+GGA_BT_TOL_DEFAULT = 1.5         # [m] GGA fix vs its local GGA-BT offset trend
+GGA_BT_WINDOW_DEFAULT = 30.0     # [s] half-window of that local linear trend
+S_FOLD_TOL_DEFAULT = 2.0         # [m] backward excursion of s that is warned
+EDGE_DRIFT_TOL_DEFAULT = 5.0     # [m] edge ensembles off / along the section
+
+POS_GGA = 0      # GGA position kept as recorded
+POS_BT = 1       # rebuilt from bottom-track increments between valid GGA anchors
+POS_INTERP = 2   # linear interpolation in time between valid GGA anchors (no BT)
+POS_RAW = 3      # invalid GGA kept because nothing better exists
+
+POS_SRC_NAMES = {POS_GGA: "gga", POS_BT: "bt", POS_INTERP: "interp", POS_RAW: "raw"}
+
+
+def hdop_filter(hdop, ok, hmax, hchange):
+    """QRev GGA HDOP filter: HDOP > hmax invalid; then, iteratively, HDOP that
+    departs from the mean of the valid ones by more than hchange invalid."""
+    h = np.asarray(hdop, dtype=float).ravel()
+    good = ok & np.isfinite(h)
+    if hmax is not None and hmax > 0:
+        good &= h <= hmax
+    if hchange is not None and hchange > 0:
+        for _ in range(20):
+            if good.sum() < 2:
+                break
+            m = float(np.mean(h[good]))
+            new = good & (np.abs(h - m) <= hchange)
+            if np.array_equal(new, good):
+                break
+            good = new
+    return good
+
+
+def bt_boat_velocity(bt_vel, n):
+    """Boat velocity over the bed (E, N) from BottomTrack.BT_Vel.
+
+    RiverSurveyor stores the velocity of the BED relative to the boat, so the
+    boat moves at -BT_Vel (checked on campaign 2026-04-15: the integrated
+    -BT_Vel track and the GGA track agree in direction in every file). Invalid
+    samples (non-finite, or faster than 10 m/s) are linearly interpolated in
+    time, as QRev does for boat velocities. Returns (v, valid) or (None, None)."""
+    if bt_vel is None:
+        return None, None
+    v = np.asarray(bt_vel, dtype=float)
+    if v.ndim != 2 or v.shape[0] != n or v.shape[1] < 2:
+        return None, None
+    v = -v[:, :2].copy()
+    ok = np.isfinite(v).all(axis=1) & (np.hypot(v[:, 0], v[:, 1]) < 10.0)
+    if ok.sum() < 2:
+        return None, None
+    idx = np.arange(n)
+    for j in (0, 1):
+        v[~ok, j] = np.interp(idx[~ok], idx[ok], v[ok, j])
+    return v, ok
+
+
+def ensemble_dt(time):
+    t = np.asarray(time, dtype=float).ravel()
+    dt = np.diff(t, prepend=np.nan)
+    good = np.isfinite(dt) & (dt > 0) & (dt < 60)
+    med = float(np.median(dt[good])) if good.any() else 1.0
+    dt[~good] = med
+    return dt
+
+
+def _robust_offset_model(t, r, ok, window, tol, max_iter=10):
+    """Local linear model of r(t) = GGA - BT (bias of the autonomous fix plus
+    slow BT drift: compass misalignment, moving bed). Fitted on the ensembles
+    still considered valid, inside +-window s of each ensemble; ensembles whose
+    residual exceeds `tol` are declared inconsistent and the model refitted
+    until nothing changes. Returns (valid mask, model at every t)."""
+    n = len(t)
+    good = ok.copy()
+    model = np.full((n, 2), np.nan)
+    for _ in range(max_iter):
+        if good.sum() < 3:
+            break
+        for i in range(n):
+            w = good & (np.abs(t - t[i]) <= window)
+            if w.sum() < 3:
+                w = good
+            tt = t[w] - t[i]
+            A = np.column_stack([np.ones(w.sum()), tt]) if np.ptp(tt) > 1e-6 \
+                else np.ones((w.sum(), 1))
+            for j in (0, 1):
+                coef, *_ = np.linalg.lstsq(A, r[w, j], rcond=None)
+                model[i, j] = coef[0]
+        res = np.hypot(*(r - model).T)
+        new = ok & (res <= tol)
+        if np.array_equal(new, good):
+            break
+        good = new
+    return good, model
+
+
+def resolve_boat_positions(utm, hdop, bt_vel, time, mode="bt", hdop_max=4.0,
+                           hdop_change=1.0, bt_tol=1.5, bt_window=30.0):
+    """6.7: GNSS screening and gap filling of the boat track.
+
+    1. HDOP filter (QRev): HDOP > hdop_max, or off the transect mean by more
+       than hdop_change, is invalid.
+    2. GGA-BT consistency (mode bt): the offset GGA - (integrated BT track)
+       varies slowly along a crossing; a GGA fix more than bt_tol metres off
+       its local linear trend is a jump (constellation change, multipath) even
+       with a normal HDOP, and is invalid.
+    3. Every invalid position is rebuilt: between two valid anchors, from the
+       BT increments with the closure spread linearly in time (traverse
+       adjustment); before the first / after the last anchor, from the BT
+       increments from that anchor. Without BT (mode interp, or BT unusable):
+       linear interpolation in time; ends held at the nearest anchor.
+    Valid GGA positions are returned UNCHANGED (a clean transect is byte for
+    byte the same as without the filter)."""
+    P0 = np.asarray(utm, dtype=float)
+    n = P0.shape[0]
+    t = np.asarray(time, dtype=float).ravel()
+    if t.size != n or not np.all(np.isfinite(t)):
+        t = np.arange(n, dtype=float)
+    fix = np.isfinite(P0).all(axis=1)
+    info = dict(mode=mode, n=n, n_nofix=int((~fix).sum()), n_hdop=0, n_jump=0,
+                n_replaced=0, max_shift=0.0, bt_used=False, note="",
+                src=np.full(n, POS_GGA, dtype=int), gga_ok=fix.copy())
+    if mode == "off":
+        return P0, info
+    ok = hdop_filter(hdop, fix, hdop_max, hdop_change) if hdop is not None \
+        and np.size(hdop) == n else fix.copy()
+    info["n_hdop"] = int((fix & ~ok).sum())
+    v = None
+    if mode == "bt":
+        v, _vok = bt_boat_velocity(bt_vel, n)
+    Pbt = None
+    if v is not None:
+        dt = ensemble_dt(t)
+        Pbt = np.cumsum(v * dt[:, None], axis=0)
+        if ok.sum() >= 3 and bt_tol is not None and bt_tol > 0:
+            ok2, _ = _robust_offset_model(t, P0 - Pbt, ok, bt_window, bt_tol)
+            info["n_jump"] = int((ok & ~ok2).sum())
+            ok = ok2
+        info["bt_used"] = True
+    info["gga_ok"] = ok
+    bad = ~ok
+    if not bad.any():
+        return P0, info
+    if ok.sum() == 0:
+        info["note"] = "sin ninguna posición GGA válida: se conservan las originales"
+        info["src"][:] = POS_RAW
+        return P0, info
+    P = P0.copy()
+    src = info["src"]
+    anchors = np.where(ok)[0]
+    i = 0
+    while i < n:
+        if ok[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not ok[j]:
+            j += 1
+        a = i - 1 if i > 0 else None          # last valid before the gap
+        b = j if j < n else None              # first valid after the gap
+        idx = np.arange(i, j)
+        if Pbt is not None:
+            if a is not None and b is not None:
+                clos = (P0[b] - P0[a]) - (Pbt[b] - Pbt[a])
+                f = ((t[idx] - t[a]) / (t[b] - t[a]))[:, None] if t[b] > t[a] \
+                    else ((idx - a) / (b - a))[:, None]
+                P[idx] = P0[a] + (Pbt[idx] - Pbt[a]) + f * clos
+            elif a is not None:
+                P[idx] = P0[a] + (Pbt[idx] - Pbt[a])
+            else:
+                P[idx] = P0[b] + (Pbt[idx] - Pbt[b])
+            src[idx] = POS_BT
+        else:
+            for k in (0, 1):
+                P[idx, k] = np.interp(t[idx], t[anchors], P0[anchors, k])
+            src[idx] = POS_INTERP
+        i = j
+    info["n_replaced"] = int(bad.sum())
+    moved = bad & fix
+    if moved.any():
+        info["max_shift"] = float(np.nanmax(np.hypot(*(P[moved] - P0[moved]).T)))
+    return P, info
+
+
+def fold_back(s, step, sel_code=3.0):
+    """Largest backward excursion [m] of s along the direction of travel, over
+    the in-transect ensembles (Step 3; all when Step is absent)."""
+    s = np.asarray(s, dtype=float)
+    k = np.asarray(step) == sel_code if step is not None else np.ones(s.size, bool)
+    k &= np.isfinite(s)
+    if k.sum() < 3:
+        return 0.0
+    x = s[k]
+    sgn = 1.0 if x[-1] >= x[0] else -1.0
+    prog = sgn * (x - x[0])
+    return float(np.max(np.maximum.accumulate(prog) - prog))
+
+
+def edge_drift(s, off, step):
+    """Movement of the boat while it was supposed to sit still at a bank:
+    for the edge ensembles of each bank (step code 2 = start, 4 = end), the
+    spread of their positions ACROSS the section line (perpendicular offset)
+    and ALONG it, in the section frame. The obliquity of the crossing itself
+    does not enter: only how far the edge ensembles are from each other."""
+    out = {}
+    if step is None:
+        return out
+    st = np.asarray(step)
+    for code in (2.0, 4.0):
+        k = (st == code) & np.isfinite(s) & np.isfinite(off)
+        if k.sum() == 0:
+            continue
+        out[int(code)] = dict(n=int(k.sum()), off_max=float(np.ptp(off[k])),
+                              s_span=float(np.ptp(s[k])))
+    return out
+
+
+def screen_positions(data: dict, utm: np.ndarray, args, log: list | None = None,
+                     label: str = ""):
+    """6.7: run resolve_boat_positions with the run's settings and log it.
+    Returns (utm, info); `utm` is unchanged when nothing is invalid."""
+    mode = str(getattr(args, "position_fill", "bt") or "bt")
+    bt_vel = data.get("bt_vel")
+    cs = data.get("coord_sys")
+    if mode == "bt" and cs is not None and int(round(cs)) != 2:
+        if log is not None:
+            log.append(f"[warn] posiciones{label}: BT_Vel no está en ENU "
+                       f"(Setup.coordinateSystem={cs:g}); relleno por interpolación "
+                       "en el tiempo en vez de bottom track")
+        mode = "interp"
+    P, info = resolve_boat_positions(
+        utm, data.get("hdop"), bt_vel, data.get("time"), mode=mode,
+        hdop_max=getattr(args, "gga_hdop_max", GGA_HDOP_MAX_DEFAULT),
+        hdop_change=getattr(args, "gga_hdop_change", GGA_HDOP_CHANGE_DEFAULT),
+        bt_tol=getattr(args, "gga_bt_tol", GGA_BT_TOL_DEFAULT),
+        bt_window=getattr(args, "gga_bt_window", GGA_BT_WINDOW_DEFAULT))
+    if mode == "bt" and not info["bt_used"] and info["n_replaced"] and log is not None:
+        # resolve_boat_positions already fell back to interpolation in time
+        log.append(f"[warn] posiciones{label}: bottom track inutilizable; "
+                   "relleno por interpolación en el tiempo")
+    q = data.get("gga_quality")
+    if q is not None and np.isfinite(q).any():
+        vals, cnt = np.unique(q[np.isfinite(q)].astype(int), return_counts=True)
+        info["quality"] = " ".join(f"{v}:{c}" for v, c in zip(vals, cnt))
+    else:
+        info["quality"] = ""
+    if log is None:
+        return P, info
+    h = data.get("hdop")
+    hs = (f"HDOP {np.nanmin(h):.1f}/{np.nanmedian(h):.1f}/{np.nanmax(h):.1f} "
+          "(mín/med/máx)") if h is not None and np.isfinite(h).any() else "sin HDOP"
+    ns = data.get("n_sats")
+    ss = (f", satélites {int(np.nanmin(ns))}-{int(np.nanmax(ns))}"
+          if ns is not None and np.isfinite(ns).any() else "")
+    log.append(f"[info] GNSS{label}: calidad GGA {info['quality'] or '?'} "
+               f"(1 autónomo, 2 diferencial, 4 RTK); {hs}{ss}; relleno={info['mode']}")
+    if mode == "off":
+        log.append(f"[info] posiciones{label}: filtro GNSS APAGADO (position-fill = off, "
+                   "v6.6)")
+    elif info["n_replaced"]:
+        tag = "[warn]" if info["max_shift"] > 1.0 or info["n_replaced"] > 0.5 * info["n"] \
+            else "[info]"
+        src = POS_SRC_NAMES.get(POS_BT if info["bt_used"] else POS_INTERP)
+        log.append(f"{tag} posiciones{label}: {info['n_replaced']}/{info['n']} ensambles "
+                   f"reconstruidos ({src}) — {info['n_hdop']} por HDOP, "
+                   f"{info['n_jump']} por salto GGA-BT > "
+                   f"{float(getattr(args, 'gga_bt_tol', GGA_BT_TOL_DEFAULT)):.1f} m, "
+                   f"{info['n_nofix']} sin fix; corrimiento máx "
+                   f"{info['max_shift']:.2f} m")
+        if info["n_replaced"] > 0.5 * info["n"]:
+            log.append(f"[warn] posiciones{label}: más de la mitad de la traza sin GGA "
+                       "válido — georreferencia apoyada en pocos puntos")
+    else:
+        log.append(f"[info] posiciones{label}: GGA válido en todos los ensambles, "
+                   "sin cambios")
+    if info.get("note"):
+        log.append(f"[warn] posiciones{label}: {info['note']}")
+    return P, info
+
+
+def track_section_qa(s_track, off_track, step, args, log, s_raw=None):
+    """6.7: fold-back of s over the crossing and drift of the edge ensembles,
+    both measured on the section the profile is built on. Returns a dict for
+    the survey index; [warn] lines go to `log`."""
+    s_track = np.asarray(s_track, dtype=float)
+    off_track = np.asarray(off_track, dtype=float)
+    fold = fold_back(s_track, step)
+    tol_f = float(getattr(args, "s_fold_tol", S_FOLD_TOL_DEFAULT))
+    raw_txt = ""
+    if s_raw is not None:
+        fr = fold_back(np.asarray(s_raw, dtype=float), step)
+        if abs(fr - fold) > 0.01:
+            raw_txt = f" (GGA sin filtrar: {fr:.2f} m)"
+    tag = "WARN" if fold > tol_f else "PASS"
+    log.append(f"[QA] retroceso de s en el cruce: {fold:.2f} m{raw_txt} "
+               f"(tol {tol_f:.1f} m) {tag}")
+    if fold > tol_f:
+        log.append(f"[warn] la traza retrocede {fold:.2f} m a lo largo de la sección "
+                   "durante el cruce: puede haber dos profundidades en el mismo s")
+    tol_e = float(getattr(args, "edge_drift_tol", EDGE_DRIFT_TOL_DEFAULT))
+    drift = edge_drift(s_track, off_track, step)
+    worst = 0.0
+    for code, d in sorted(drift.items()):
+        name = "inicial" if code == 2 else "final"
+        worst = max(worst, d["off_max"], d["s_span"])
+        bad = d["off_max"] > tol_e or d["s_span"] > tol_e
+        log.append(f"[QA] deriva en el borde {name} ({d['n']} ens.): "
+                   f"{d['off_max']:.1f} m transversal a la sección, {d['s_span']:.1f} m "
+                   f"a lo largo (tol {tol_e:.1f} m) {'WARN' if bad else 'PASS'}")
+        if bad:
+            log.append(f"[warn] borde {name}: el bote derivó durante la medición de borde "
+                       f"({d['off_max']:.1f} m fuera de la línea de sección, "
+                       f"{d['s_span']:.1f} m a lo largo); "
+                       + ("los retornos lejos de la línea son de otro fondo y el "
+                          "ajuste los descarta por distancia perpendicular"
+                          if d["off_max"] > tol_e else
+                          "entran al ajuste en el s donde estuvo el bote"))
+    return dict(s_fold=fold, edge_drift=worst if drift else float("nan"))
 
 
 def resolve_beam_layout(data, args, log=None):
@@ -1978,6 +2671,10 @@ def build_beam_cloud(data: dict, utm: np.ndarray,
                 pts_ens.append(i); pts_src.append(SRC_BT)
                 pts_pri.append(depth_ref == "bt")
 
+    _ens = np.asarray(pts_ens, dtype=int)
+    _smp = np.asarray(data.get("sample", np.arange(1, n + 1)), dtype=int).ravel()
+    if _smp.size != n:
+        _smp = np.arange(1, n + 1, dtype=int)
     return dict(
         E=np.asarray(pts_e),
         N=np.asarray(pts_n),
@@ -1985,7 +2682,10 @@ def build_beam_cloud(data: dict, utm: np.ndarray,
         weight=np.asarray(pts_w),
         beam_index=np.asarray(pts_b, dtype=int),
         beam_freq_khz=np.asarray(pts_f),
-        ens=np.asarray(pts_ens, dtype=int),
+        sample=_smp[_ens] if _ens.size else np.array([], dtype=int),   # 6.8
+        keep=np.ones(_ens.size, dtype=bool),                            # 6.8
+        descarte=np.full(_ens.size, "", dtype=object),                  # 6.8
+        ens=_ens,
         src=np.asarray(pts_src, dtype=int),
         primary=np.asarray(pts_pri, dtype=bool),
     )
@@ -4566,18 +5266,26 @@ def export_raw_points(outdir: Path, perfil_id: str, cloud: dict, s_pts: np.ndarr
     lon, lat = tr_to_ll.transform(cloud["E"], cloud["N"])
     xp, yp   = tr_to_posgar.transform(cloud["E"], cloud["N"])
 
+    # 6.8: two trailing columns — `ens` (RSL sample number, the one [descartes]
+    # uses) and `descarte` (the rule that dropped the point, empty if kept).
+    # Discarded points stay in the file so the cloud is still complete.
+    n = len(s_pts)
+    smp = np.asarray(cloud.get("sample", np.asarray(cloud["ens"]) + 1), dtype=int)
+    why = cloud.get("descarte")
+    if why is None or len(why) != n:
+        why = np.full(n, "", dtype=object)
     path = outdir / "raw_bed_points.csv"
     with open(path, "w", encoding="utf-8") as f:
         f.write("perfil,s_m,depth_m,beam_index,beam_id,beam_freq_khz,"
-                "x_utm,y_utm,latitude_deg,longitude_deg,x_out,y_out\n")
-        for i in range(len(s_pts)):
+                "x_utm,y_utm,latitude_deg,longitude_deg,x_out,y_out,ens,descarte\n")
+        for i in range(n):
             _b = int(cloud["beam_index"][i])
             f.write(f"{perfil_id},{s_pts[i]:.4f},{cloud['depth'][i]:.4f},"
                     f"{_b},{'VB' if _b == 0 else 'B' + str(_b)},"
                     f"{cloud['beam_freq_khz'][i]:.0f},"
                     f"{cloud['E'][i]:.4f},{cloud['N'][i]:.4f},"
                     f"{lat[i]:.8f},{lon[i]:.8f},"
-                    f"{xp[i]:.4f},{yp[i]:.4f}\n")
+                    f"{xp[i]:.4f},{yp[i]:.4f},{smp[i]},{why[i]}\n")
     return path
 
 
@@ -4599,7 +5307,8 @@ def plot_plan_view(outdir: Path, perfil_id: str, progresiva_m,
                     utm: np.ndarray, cloud: dict,
                     axis_origin: tuple[float, float], theta_section: float,
                     s_grid_extent: tuple[float, float],
-                    theta_flow: float, brazo: str = ""):
+                    theta_flow: float, brazo: str = "",
+                    utm_gga: np.ndarray | None = None, pos_src=None):
     """
     Plan view with:
         - boat track (orange)
@@ -4623,9 +5332,30 @@ def plot_plan_view(outdir: Path, perfil_id: str, progresiva_m,
     ax.scatter(cloud["E"][m_vb],   cloud["N"][m_vb],   s=8, c="black",
                alpha=0.65, label="VB (500 kHz)")
 
+    # --- 6.7: recorded GGA where the screening rebuilt positions -----------
+    rebuilt = None
+    if utm_gga is not None and pos_src is not None:
+        rebuilt = np.asarray(pos_src) != 0
+        if rebuilt.any():
+            ax.plot(utm_gga[:, 0], utm_gga[:, 1], "--", color="0.55", lw=1.0,
+                    label="GGA registrado (sin filtrar)")
+            ax.plot(utm_gga[rebuilt, 0], utm_gga[rebuilt, 1], "x", ms=5,
+                    color="0.45", label="GGA descartado")
+            for k in np.where(rebuilt)[0]:
+                if np.isfinite(utm_gga[k]).all():
+                    ax.plot([utm_gga[k, 0], utm[k, 0]], [utm_gga[k, 1], utm[k, 1]],
+                            "-", color="0.7", lw=0.6)
+        else:
+            rebuilt = None
+
     # --- boat track --------------------------------------------------------
     ax.plot(utm[:, 0], utm[:, 1], "-", color="tab:orange", lw=1.5,
             label="Trayectoria del bote")
+    if rebuilt is not None:
+        ax.plot(utm[rebuilt, 0], utm[rebuilt, 1], "o", ms=5, color="tab:purple",
+                label="Posición reconstruida ("
+                      + ("bottom track" if np.any(np.asarray(pos_src) == POS_BT)
+                         else "interpolada") + ")")
     ax.plot(utm[:, 0], utm[:, 1], "o", ms=3, color="tab:orange", alpha=0.7)
     ax.plot(utm[0, 0], utm[0, 1], "^", ms=10, color="tab:orange",
             markeredgecolor="black", label="Inicio de trayectoria")
@@ -4667,8 +5397,10 @@ def plot_plan_view(outdir: Path, perfil_id: str, progresiva_m,
 
     # Lock axis limits to the data extent (with a small pad).
     pad = 0.08 * track_extent + 1.0
-    all_E = np.concatenate([utm[:, 0], cloud["E"], [Ea, Eb, hE]])
-    all_N = np.concatenate([utm[:, 1], cloud["N"], [Na, Nb, hN]])
+    all_E = np.concatenate([utm[:, 0], cloud["E"], [Ea, Eb, hE]]
+                           + ([utm_gga[:, 0]] if rebuilt is not None else []))
+    all_N = np.concatenate([utm[:, 1], cloud["N"], [Na, Nb, hN]]
+                           + ([utm_gga[:, 1]] if rebuilt is not None else []))
     ax.set_xlim(np.nanmin(all_E) - pad, np.nanmax(all_E) + pad)
     ax.set_ylim(np.nanmin(all_N) - pad, np.nanmax(all_N) + pad)
 
@@ -4715,8 +5447,11 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
                         brazo: str = "", ws_elev=None,
                         datum_name: str = DATUM_NAME_DEFAULT,
                         river: str = "", src_grid=None, bed_meta=None,
-                        depth_ref: str = "vb"):
+                        depth_ref: str = "vb", discarded=None):
     """Cross-section: beam cloud + smoothed bed.
+
+    6.8: `discarded` (bool per point) marks the points dropped by [descartes];
+    they are drawn as red crosses and left out of the grey/blue clouds.
 
     If `ws_elev` is given, the vertical axis is ABSOLUTE elevation in the datum
     (bed and beams plotted as ws_elev - depth, water surface drawn at ws_elev).
@@ -4746,14 +5481,20 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
     ax.fill_between(s_grid, y_surf, y_bed, color="#cfe6f5", alpha=0.55, lw=0, zorder=0)
     ax.fill_between(s_grid, y_bed, y_floor, color="#7a5230", alpha=0.30, lw=0, zorder=1)
 
-    m_lat = beam_idx > 0
-    m_vb = beam_idx == 0
+    m_dis = (np.asarray(discarded, dtype=bool)
+             if discarded is not None and len(discarded) == len(beam_idx)
+             else np.zeros(len(beam_idx), dtype=bool))
+    m_lat = (beam_idx > 0) & ~m_dis
+    m_vb = (beam_idx == 0) & ~m_dis
     if np.any(m_lat):
         ax.scatter(s_pts[m_lat], e0 - depth_pts[m_lat], s=5, c="#5b7fa6",
                    alpha=0.18, lw=0, zorder=2)
     if np.any(m_vb):
         ax.scatter(s_pts[m_vb], e0 - depth_pts[m_vb], s=9, c="#222222",
                    alpha=0.65, lw=0, zorder=3)
+    if np.any(m_dis):
+        ax.scatter(s_pts[m_dis], e0 - depth_pts[m_dis], s=16, marker="x",
+                   c="#c0392b", lw=0.9, alpha=0.85, zorder=5)
     styled = bed_meta is not None and src_grid is not None \
         and len(src_grid) == len(s_grid)
     segs = (_bed_segments(s_grid, y_bed, src_grid, bed_meta["lo"], bed_meta["hi"])
@@ -4798,13 +5539,13 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
     bits = [f"Perfil {perfil_id}"]
     if brazo:
         bits.append(f"brazo {brazo}")
-    bits.append(f"ancho {s1 - s0:.1f} m".replace(".", ","))
-    bits.append(f"prof. máx {float(np.nanmax(depth_grid)):.2f} m".replace(".", ","))
+    bits.append(f"ancho {s1 - s0:.1f} m")
+    bits.append(f"prof. máx {float(np.nanmax(depth_grid)):.2f} m")
     if absolute:
         _int = depth_grid > 1e-6
         _th = float(np.nanmin(y_bed[_int])) if np.any(_int) else float(np.nanmin(y_bed))
-        bits.append(f"thalweg {_th:.2f} m".replace(".", ","))
-        bits.append(f"pelo de agua {y_surf:.2f} m {datum_name}".replace(".", ","))
+        bits.append(f"thalweg {_th:.2f} m")
+        bits.append(f"pelo de agua {y_surf:.2f} m {datum_name}")
     else:
         bits.append("cotas RELATIVAS (sin pelo de agua)")
     if styled:
@@ -4835,6 +5576,9 @@ def plot_cross_section(outdir: Path, perfil_id: str, progresiva_m,
                label="Haces laterales (BT)" + (" · referencia" if ref_bt and styled
                                                else "")),
     ]
+    if np.any(m_dis):
+        handles.append(Line2D([], [], marker="x", ls="", color="#c0392b", ms=5,
+                              mew=1.0, label=f"Descartado [descartes] ({int(m_dis.sum())})"))
     ncol = len(handles) if len(handles) <= 4 else 3
     rows = math.ceil(len(handles) / ncol)
     ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.135),
@@ -5265,6 +6009,9 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         Ex, Ny = tr.transform(data["lon"], data["lat"])
         utm = np.column_stack([Ex, Ny])
         log.append("[info] derived UTM from Lat/Lon")
+    # 6.7: HDOP + GGA/bottom-track screening; invalid fixes rebuilt from BT
+    utm_gga = utm.copy()
+    utm, pos_info = screen_positions(data, utm, args, log)
     utm = apply_gnss_lag(utm, data["time"], getattr(args, "gnss_lag", 0.0), log)
     utm = apply_antenna_offset(utm, data["heading"], getattr(args, "antenna_offset", None), log)
 
@@ -5308,13 +6055,17 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
     # ------------------------------------------------------------ STEP 4
     centroid = (float(np.nanmean(utm[:, 0])), float(np.nanmean(utm[:, 1])))
     s_pts_TL, d_off_TL = project_to_axis(cloud["E"], cloud["N"], centroid, theta_section)
-    s_track_TL, _      = project_to_axis(utm[:, 0], utm[:, 1], centroid, theta_section)
+    s_track_TL, off_track = project_to_axis(utm[:, 0], utm[:, 1], centroid, theta_section)
     s_pts   = -s_pts_TL
     s_track = -s_track_TL
     ux_LR = -math.cos(theta_section)
     uy_LR = -math.sin(theta_section)
     s_data_min = float(np.nanmin(s_pts))
     s_data_max = float(np.nanmax(s_pts))
+    # 6.7: QA of the track against the section — fold-back and edge drift
+    track_qa = track_section_qa(s_track, off_track, data.get("step"), args, log,
+                                s_raw=-project_to_axis(utm_gga[:, 0], utm_gga[:, 1],
+                                                       centroid, theta_section)[0])
 
     edge_l = data["edge_left"]  if not args.no_edge_extrapolation else 0.0
     edge_r = data["edge_right"] if not args.no_edge_extrapolation else 0.0
@@ -5473,28 +6224,47 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
                                        centroid=centroid, log=log, river=river)
 
     # ------------------------------------------------------------ STEP 5
+    # 6.8: [descartes] — rules are read in the frame of the run WITHOUT
+    # discards (the cross_section.png the operator looked at)
+    disc_rules = discard_rules_for(args, perfil_id)
+    fk = np.ones(len(s_pts), dtype=bool)
+    shift0 = None
+    if disc_rules:
+        _lo0, _, _ = measured_extent(
+            s_pts, cloud["depth"], beam_index=cloud["beam_index"],
+            primary=cloud["primary"], mode=args.edge_extent,
+            use_primary=(args.edge_anchor == "ref"), log=None)
+        shift0 = section_frame_shift(args, edge_l, _lo0, s_pts)
+        fk, _why = apply_discards(cloud, s_pts + shift0, disc_rules, ws_elev,
+                                  log, perfil_id, allow_ens=True)
+        cloud["keep"], cloud["descarte"] = fk, _why
     ext_lo, ext_hi, _ext_det = measured_extent(
-        s_pts, cloud["depth"], beam_index=cloud["beam_index"],
-        primary=cloud["primary"], mode=args.edge_extent,
+        s_pts[fk], cloud["depth"][fk], beam_index=cloud["beam_index"][fk],
+        primary=cloud["primary"][fk], mode=args.edge_extent,
         use_primary=(args.edge_anchor == "ref"), log=log)
     bed_meta = None
     if args.bed_fit == "median":                       # v6.3 core, untouched
         s_grid, depth_grid, s_shift, src_grid = build_profile(
-            s_pts, cloud["depth"], eff_weight,
-            s_data_min, s_data_max, dx=args.dx,
+            s_pts[fk], cloud["depth"][fk], eff_weight[fk],
+            float(np.nanmin(s_pts[fk])), float(np.nanmax(s_pts[fk])), dx=args.dx,
             bin_half_width=args.bin_half_width,
             edge_left_dist=edge_l, edge_right_dist=edge_r,
-            beam_index=cloud["beam_index"],
-            primary=cloud["primary"], src=cloud["src"],
+            beam_index=cloud["beam_index"][fk],
+            primary=cloud["primary"][fk], src=cloud["src"][fk],
             composite=composite_on, primary_min=args.vb_min,
             edge_anchor=args.edge_anchor, ref_extent=(ext_lo, ext_hi),
         )
     else:
         s_grid, depth_grid, s_shift, src_grid, bed_meta = build_profile_loess(
-            s_pts, cloud["depth"], eff_weight, (ext_lo, ext_hi), edge_l, edge_r,
-            args.dx, h0=bed_halfwidth(args), primary=cloud["primary"],
-            src=cloud["src"], composite=composite_on, primary_min=args.vb_min,
+            s_pts[fk], cloud["depth"][fk], eff_weight[fk], (ext_lo, ext_hi),
+            edge_l, edge_r, args.dx, h0=bed_halfwidth(args),
+            primary=cloud["primary"][fk], src=cloud["src"][fk],
+            composite=composite_on, primary_min=args.vb_min,
             shape_l=shape_l, shape_r=shape_r)
+    if shift0 is not None and abs(s_shift - shift0) > 0.005:
+        log.append(f"[info] [descartes] los descartes cambiaron la extensión medida: "
+                   f"el origen de s se corrió {s_shift - shift0:+.2f} m respecto de la "
+                   "corrida sin descartes (los rangos s del INI se leen sin descartes)")
     bhw = bed_halfwidth(args)
     s_pts_final = s_pts + s_shift
     # Geographic origin of the profile (s = 0 = left bank), consistent with the
@@ -5535,13 +6305,14 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
     plot1 = plot_plan_view(outdir, perfil_id, progresiva_m, utm, cloud,
                            axis_origin, theta_section_final,
                            (float(s_grid[0]), float(s_grid[-1])),
-                           theta_flow=theta_flow, brazo=brazo)
+                           theta_flow=theta_flow, brazo=brazo,
+                           utm_gga=utm_gga, pos_src=pos_info["src"])
     plot2 = plot_cross_section(outdir, perfil_id, progresiva_m,
                                s_pts_final, cloud["depth"], cloud["beam_index"],
                                s_grid, depth_grid,
                                brazo=brazo, ws_elev=ws_elev, datum_name=datum_name,
                                river=river, src_grid=src_grid, bed_meta=bed_meta,
-                               depth_ref=depth_ref)
+                               depth_ref=depth_ref, discarded=~fk)
     for _pl in (plot1, plot2):
         if _pl: log.append(f"[ok ] {_pl.name}")
 
@@ -5594,13 +6365,14 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
     # Raw beam cloud in POSGAR07 (for the merged survey point cloud). Z is the
     # ABSOLUTE bed elevation (ws_elev - depth) when a water surface is available,
     # otherwise a relative depth (-depth) flagged as such.
+    # 6.8: points dropped by [descartes] do not go to the survey cloud
     tr_pg = Transformer.from_crs(utm_crs, posgar_crs, always_xy=True)
-    cxp, cyp = tr_pg.transform(cloud["E"], cloud["N"])
+    cxp, cyp = tr_pg.transform(cloud["E"][fk], cloud["N"][fk])
     cloud_rel = ws_elev is None
     if ws_elev is None:
-        cloud_z = -cloud["depth"]
+        cloud_z = -cloud["depth"][fk]
     else:
-        cloud_z = float(ws_elev) - cloud["depth"]
+        cloud_z = float(ws_elev) - cloud["depth"][fk]
 
     return dict(
         perfil=perfil_id, outdir=outdir,
@@ -5617,8 +6389,9 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         utm_crs=utm_crs, posgar_crs=posgar_crs, log=log,
         # merged-cloud stash (one entry per (sample, beam) footprint)
         cloud_xp=np.asarray(cxp), cloud_yp=np.asarray(cyp), cloud_z=cloud_z,
-        cloud_depth=cloud["depth"], cloud_beam_index=cloud["beam_index"],
-        cloud_ens=cloud["ens"], cloud_rel=cloud_rel,
+        cloud_depth=cloud["depth"][fk], cloud_beam_index=cloud["beam_index"][fk],
+        cloud_ens=cloud["ens"][fk], cloud_rel=cloud_rel,
+        n_descartes=int(np.count_nonzero(~fk)),                         # 6.8
         # ---- v6: everything the aforo grouping engine needs ----
         theta_section=theta_section_final, orient_forced=orient_forced,
         t_start=t_start,
@@ -5633,6 +6406,8 @@ def process_one(matpath: Path, args, network=None, wsp=None, station_ws=None, ou
         # 6.4
         edge_methods=(data.get("edge_method_left"), data.get("edge_method_right")),
         edge_shapes=(shape_l, shape_r), bed_fit=args.bed_fit, bed_meta=bed_meta,
+        # 6.7
+        pos_info=pos_info, track_qa=track_qa,
     )
 
 
@@ -5771,6 +6546,11 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
     log: list[str] = [f"[info] GRUPO {gid}: {len(group)} repeticiones promediadas",
                       f"[info] miembros: {', '.join(r['perfil'] for r in group)}",
                       f"[info] outdir : {outdir}"]
+    for r in group:                                          # 6.7
+        pi = r.get("pos_info") or {}
+        if pi.get("n_replaced"):
+            log.append(f"[info] {r['perfil']}: {pi['n_replaced']}/{pi['n']} posiciones "
+                       f"reconstruidas (corrimiento máx {pi['max_shift']:.2f} m)")
 
     # ---- group axis: pooled unit-discharge direction of all in-transect ens.
     theta_flow, theta_section = group_flow_direction(group, args, log)
@@ -5821,27 +6601,62 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
     # 6.3: the extent is the AVERAGE of the per-(repetition x beam) extents on
     # the common axis, not the envelope of the merged cloud. v6.2 made a group
     # systematically wider than any of its own repetitions.
+    # 6.8: [descartes] — members' discards come in with the merged cloud;
+    # rules keyed by the GROUP id are read on the group axis, in the frame of
+    # the group WITHOUT any discard.
+    fk = np.asarray(cloud.get("keep", np.ones(len(s_pts), dtype=bool)), dtype=bool)
+    if fk.size != len(s_pts):
+        fk = np.ones(len(s_pts), dtype=bool)
+    n_mem = int(np.count_nonzero(~fk))
+    if n_mem:
+        log.append(f"[info] [descartes] {n_mem} puntos descartados en los miembros "
+                   "quedan fuera del ajuste del grupo")
+    g_rules = discard_rules_for(args, gid, members=[r["perfil"] for r in group])
+    shift0 = None
+    if g_rules:
+        _lo0, _, _ = measured_extent(
+            s_pts, cloud["depth"], beam_index=cloud["beam_index"],
+            rep=cloud.get("rep"), primary=cloud["primary"], mode=args.edge_extent,
+            use_primary=(args.edge_anchor == "ref"), log=None)
+        shift0 = section_frame_shift(args, edge_l, _lo0, s_pts)
+        _wsv = [r["ws_elev"] for r in group if r.get("ws_elev") is not None]
+        _gk, _gwhy = apply_discards(cloud, s_pts + shift0, g_rules,
+                                    float(np.mean(_wsv)) if _wsv else None,
+                                    log, gid, allow_ens=False)
+        _why = np.asarray(cloud.get("descarte", np.full(len(s_pts), "", dtype=object)),
+                          dtype=object)
+        _why = np.where(fk, _gwhy, _why)
+        fk = fk & _gk
+        cloud["keep"], cloud["descarte"] = fk, _why
+    _rep = cloud.get("rep")
     ext_lo, ext_hi, ext_det = measured_extent(
-        s_pts, cloud["depth"], beam_index=cloud["beam_index"],
-        rep=cloud.get("rep"), primary=cloud["primary"], mode=args.edge_extent,
+        s_pts[fk], cloud["depth"][fk], beam_index=cloud["beam_index"][fk],
+        rep=(None if _rep is None else np.asarray(_rep)[fk]),
+        primary=cloud["primary"][fk], mode=args.edge_extent,
         use_primary=(args.edge_anchor == "ref"), log=log)
     bed_meta = None
     if args.bed_fit == "median":                       # v6.3 core, untouched
         s_grid, depth_grid, s_shift, src_grid = build_profile(
-            s_pts, cloud["depth"], eff_weight,
-            float(np.nanmin(s_pts)), float(np.nanmax(s_pts)), dx=args.dx,
+            s_pts[fk], cloud["depth"][fk], eff_weight[fk],
+            float(np.nanmin(s_pts[fk])), float(np.nanmax(s_pts[fk])), dx=args.dx,
             bin_half_width=args.bin_half_width,
             edge_left_dist=edge_l, edge_right_dist=edge_r,
-            beam_index=cloud["beam_index"], primary=cloud["primary"], src=cloud["src"],
+            beam_index=cloud["beam_index"][fk], primary=cloud["primary"][fk],
+            src=cloud["src"][fk],
             composite=ref.get("composite", True), primary_min=args.vb_min,
             edge_anchor=args.edge_anchor, ref_extent=(ext_lo, ext_hi),
         )
     else:
         s_grid, depth_grid, s_shift, src_grid, bed_meta = build_profile_loess(
-            s_pts, cloud["depth"], eff_weight, (ext_lo, ext_hi), edge_l, edge_r,
-            args.dx, h0=bed_halfwidth(args), primary=cloud["primary"],
-            src=cloud["src"], composite=ref.get("composite", True),
+            s_pts[fk], cloud["depth"][fk], eff_weight[fk], (ext_lo, ext_hi),
+            edge_l, edge_r, args.dx, h0=bed_halfwidth(args),
+            primary=cloud["primary"][fk], src=cloud["src"][fk],
+            composite=ref.get("composite", True),
             primary_min=args.vb_min, shape_l=shape_l, shape_r=shape_r)
+    if shift0 is not None and abs(s_shift - shift0) > 0.005:
+        log.append(f"[info] [descartes] los descartes cambiaron la extensión medida: "
+                   f"el origen de s se corrió {s_shift - shift0:+.2f} m respecto del "
+                   "grupo sin descartes (los rangos s del INI se leen sin descartes)")
         log.append(f"[info] lecho medido s = {bed_meta['lo']:.2f} a {bed_meta['hi']:.2f} m "
                    f"(fit loess, semiancho {bed_meta['h0']:.2f} m)")
     _bed_source_log(src_grid, log)
@@ -5976,7 +6791,8 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
                             s_pts + s_shift, cloud["depth"], cloud["beam_index"],
                             s_grid, depth_grid, brazo=brazo, ws_elev=ws_elev,
                             datum_name=datum_name, river=river, src_grid=src_grid,
-                            bed_meta=bed_meta, depth_ref=ref.get("depth_ref", "vb"))
+                            bed_meta=bed_meta, depth_ref=ref.get("depth_ref", "vb"),
+                            discarded=~fk)
     if p2: log.append(f"[ok ] {p2.name}")
     pqc = plot_group_qc(outdir, gid, s_grid, depth_grid, stack, sigma, group,
                         ws_elev=ws_elev, datum_name=datum_name, qstat=qstat)
@@ -6008,9 +6824,9 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
 
     # POSGAR cloud for the merged survey point cloud
     tr_p = Transformer.from_crs(utm_crs, posgar_crs, always_xy=True)
-    cxp, cyp = tr_p.transform(cloud["E"], cloud["N"])
-    cloud_z = ((ws_elev - cloud["depth"]) if ws_elev is not None
-               else -cloud["depth"])
+    cxp, cyp = tr_p.transform(cloud["E"][fk], cloud["N"][fk])       # 6.8: kept only
+    cloud_z = ((ws_elev - cloud["depth"][fk]) if ws_elev is not None
+               else -cloud["depth"][fk])
 
     return dict(
         perfil=gid, outdir=outdir,
@@ -6029,8 +6845,9 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         n_samples=int(sum(r["n_samples"] for r in group)),
         utm_crs=utm_crs, posgar_crs=posgar_crs, log=log,
         cloud_xp=np.asarray(cxp), cloud_yp=np.asarray(cyp), cloud_z=cloud_z,
-        cloud_depth=cloud["depth"], cloud_beam_index=cloud["beam_index"],
-        cloud_ens=cloud["ens"], cloud_rel=(ws_elev is None),
+        cloud_depth=cloud["depth"][fk], cloud_beam_index=cloud["beam_index"][fk],
+        cloud_ens=cloud["ens"][fk], cloud_rel=(ws_elev is None),
+        n_descartes=int(np.count_nonzero(~fk)),                         # 6.8
         src_grid=src_grid, edge_l=edge_l, edge_r=edge_r,
         t_start=min((r["t_start"] for r in group if r.get("t_start")), default=None),
         group_chainage=progresiva_m,
@@ -6048,7 +6865,39 @@ def process_group(group, args, network=None, wsp=None, station_ws=None,
         composite=ref.get("composite", True), orient_qc=ref.get("orient_qc", {}),
         # 6.4
         edge_shapes=(shape_l, shape_r), bed_fit=args.bed_fit, bed_meta=bed_meta,
+        # 6.7: members' GNSS screening and track QA, pooled
+        pos_info=_pool_pos_info(group), track_qa=_pool_track_qa(group),
     )
+
+
+def _pool_pos_info(results):
+    """6.7: GNSS-screening counts of several transects summed (max for the
+    shift), for a group row of the survey index."""
+    infos = [r.get("pos_info") for r in results if r.get("pos_info")]
+    if not infos:
+        return None
+    out = dict(n=sum(i["n"] for i in infos), n_hdop=sum(i["n_hdop"] for i in infos),
+               n_jump=sum(i["n_jump"] for i in infos),
+               n_replaced=sum(i["n_replaced"] for i in infos),
+               n_nofix=sum(i["n_nofix"] for i in infos),
+               max_shift=max(i["max_shift"] for i in infos))
+    qs = {}
+    for i in infos:
+        for tok in str(i.get("quality", "")).split():
+            k, _, v = tok.partition(":")
+            qs[k] = qs.get(k, 0) + int(v or 0)
+    out["quality"] = " ".join(f"{k}:{v}" for k, v in sorted(qs.items()))
+    return out
+
+
+def _pool_track_qa(results):
+    """6.7: worst fold-back and edge drift among the members."""
+    qa = [r.get("track_qa") for r in results if r.get("track_qa")]
+    if not qa:
+        return None
+    return dict(s_fold=max(q["s_fold"] for q in qa),
+                edge_drift=float(np.nanmax([q["edge_drift"] for q in qa]))
+                if any(np.isfinite(q["edge_drift"]) for q in qa) else float("nan"))
 
 
 # ============================================================================ #
@@ -6072,11 +6921,23 @@ def _sort_key(r):
             float("inf") if x is None else float(x))
 
 
+def _pos_cols(r, _f):
+    """6.7: GNSS-screening and track-QA columns of the survey index."""
+    pi = r.get("pos_info") or {}
+    qa = r.get("track_qa") or {}
+    return [pi.get("quality", ""),
+            pi.get("n_hdop", ""), pi.get("n_jump", ""), pi.get("n_replaced", ""),
+            _f(pi.get("max_shift"), "{:.2f}"),
+            _f(qa.get("s_fold"), "{:.2f}"), _f(qa.get("edge_drift"), "{:.1f}")]
+
+
 def write_survey_index(results, resumen_dir: Path, datum_name: str):
     """One row per transect: river, official km, brazo, cotas, ancho, WS source.
     6.1: written with the csv module (notes may contain commas); `recorrido`
     and `loc_method` appended at the end so existing column positions hold.
-    6.4: `forma_mi`, `forma_md` (bank shape used) and `bed_fit` appended too."""
+    6.4: `forma_mi`, `forma_md` (bank shape used) and `bed_fit` appended too.
+    6.7: GNSS screening (gga_q, pos_*) and track QA (s_fold_m, edge_drift_m).
+    6.8: `descartes` — points dropped by [descartes] (members + group rules)."""
     path = resumen_dir / "survey_index.csv"
     rs = sorted(results, key=_sort_key)
 
@@ -6090,7 +6951,9 @@ def write_survey_index(results, resumen_dir: Path, datum_name: str):
                     "survey_chainage_m", "ws_elev_m", "ws_source", "thalweg_elev_m",
                     "max_depth_m", "width_m", "n_samples", "dist_axis_m",
                     "theta_flow_deg", "ws_note", "q_m3s", "recorrido", "loc_method",
-                    "forma_mi", "forma_md", "bed_fit"])
+                    "forma_mi", "forma_md", "bed_fit",
+                    "gga_q", "pos_hdop", "pos_jump", "pos_rebuilt",
+                    "pos_shift_max_m", "s_fold_m", "edge_drift_m", "descartes"])
         for r in rs:
             kmo = r.get("km_oficial")
             absolute = r["ws_elev"] is not None
@@ -6104,7 +6967,8 @@ def write_survey_index(results, resumen_dir: Path, datum_name: str):
                 _f(r["dist_axis"], "{:.1f}"), f"{math.degrees(r['theta_flow']):.1f}",
                 r["ws_note"], _f(r.get("q_total"), "{:.3f}"),
                 r.get("recorrido", ""), r.get("loc_method", ""),
-                *(r.get("edge_shapes") or ("", "")), r.get("bed_fit", "")])
+                *(r.get("edge_shapes") or ("", "")), r.get("bed_fit", ""),
+                *_pos_cols(r, _f), r.get("n_descartes", 0)])
     return path
 
 
@@ -7009,6 +7873,10 @@ def process_track(matpath: Path, args, network=None, wsm=None, out_crs=None,
         tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
         ex, ny = tr.transform(data["lon"], data["lat"])
         utm = np.column_stack([ex, ny])
+    # 6.7: same GNSS screening as the transects; only its warnings are logged
+    _plog: list[str] = []
+    utm, _pinfo = screen_positions(data, utm, args, _plog, label=f" recorrido {stem}")
+    log.extend(x for x in _plog if x.startswith("[warn]"))
     utm = apply_gnss_lag(utm, data["time"], getattr(args, "gnss_lag", 0.0))
     utm = apply_antenna_offset(utm, data["heading"], getattr(args, "antenna_offset", None))
 
@@ -7225,6 +8093,8 @@ def process_track(matpath: Path, args, network=None, wsm=None, out_crs=None,
         off_axis=np.asarray(off_pt, dtype=float),
         dist_axis=np.asarray(dist_pt, dtype=float),
         t_utc=t_pt,
+        pos_rebuilt=int(_pinfo["n_replaced"]),                     # 6.7
+        pos_shift_max=float(_pinfo["max_shift"]),
     )
 
 
@@ -7319,7 +8189,8 @@ def write_tracks_index(tracks, resumen_dir: Path):
         w = csv.writer(f)
         w.writerow(["archivo", "clase", "origen_clase", "n_ensambles", "n_sin_fix",
                     "n_puntos", "rios", "km_inicio", "km_fin", "largo_traza_m",
-                    "inicio", "duracion_min", "ws_source", "avisos"])
+                    "inicio", "duracion_min", "ws_source", "avisos",
+                    "pos_reconstruidas", "pos_corrimiento_max_m"])
         for t in sorted(tracks, key=lambda q: (q["rivers"][:1], q["km_min"]
                                                if np.isfinite(q["km_min"]) else 0.0)):
             w.writerow([
@@ -7332,6 +8203,8 @@ def write_tracks_index(tracks, resumen_dir: Path):
                 "" if not np.isfinite(t["dur_min"]) else f"{t['dur_min']:.1f}",
                 ", ".join(f"{k} {v}" for k, v in sorted(t["ws_tally"].items())),
                 "; ".join(t["warn"]),
+                t.get("pos_rebuilt", ""),
+                "" if t.get("pos_shift_max") is None else f"{t['pos_shift_max']:.2f}",
             ])
     return path
 
@@ -7443,6 +8316,21 @@ def prescan_transects(matfiles, network, args=None, log: list | None = None):
             # 6.2: same GNSS-dropout mask as process_one, so the pre-scan places
             # the transect from the same positions the run will use
             lat, lon, utm, _n = _mask_gnss_dropouts(lat, lon, utm)
+            # 6.7: the pre-scan has no bottom track at hand: only the HDOP
+            # filter, and the rejected fixes are simply left out
+            hd = get_field(gps, "HDOP")
+            if (args is not None and getattr(args, "position_fill", "bt") != "off"
+                    and hd is not None and np.size(hd) == lat.size):
+                fx = np.isfinite(lat) & np.isfinite(lon)
+                okh = hdop_filter(np.asarray(hd, dtype=float).ravel(), fx,
+                                  getattr(args, "gga_hdop_max", GGA_HDOP_MAX_DEFAULT),
+                                  getattr(args, "gga_hdop_change",
+                                          GGA_HDOP_CHANGE_DEFAULT))
+                if okh.sum() >= 2:
+                    lat = np.where(okh, lat, np.nan)
+                    lon = np.where(okh, lon, np.nan)
+                    if utm is not None and np.ndim(utm) == 2:
+                        utm = np.where(okh[:, None], utm, np.nan)
             utm_crs = auto_utm_crs(lat, lon)
             if utm is None or utm.ndim != 2 or not np.isfinite(utm).any():
                 tr = Transformer.from_crs(CRS.from_epsg(4326), utm_crs, always_xy=True)
@@ -7666,12 +8554,14 @@ def load_config(path, parser=None, log: list | None = None):
              _find_section(cp, _TRACK_SECTIONS),          # 6.2: [recorridos]
              _find_section(cp, _ORIENT_SECTIONS),         # 6.6: [orientacion]
              _find_section(cp, _JUMP_SECTIONS),           # 6.6: [saltos]
-             _find_section(cp, _LOC_SECTIONS)]            # 6.6: [ubicacion]
+             _find_section(cp, _LOC_SECTIONS),            # 6.6: [ubicacion]
+             _find_section(cp, _DISCARD_SECTIONS)]        # 6.8: [descartes]
     for sec in cp.sections():
         if sec not in known:
             log.append(f"[warn] config: unknown section [{sec}] — ignored (valid: "
                        "[campanha], [procesamiento], [progresivas], [grupos], "
-                       "[rios], [recorridos], [orientacion], [saltos], [ubicacion])")
+                       "[rios], [recorridos], [orientacion], [saltos], [ubicacion], "
+                       "[descartes])")
 
     return params, campania, river_offsets, manual_groups
 
@@ -8119,6 +9009,35 @@ def build_parser():
                         "which a transect is not processed (default 0.30).")
     p.add_argument("--allow-gps-gaps", action="store_true",
                    help="6.2: process a transect anyway, past --gps-max-gap.")
+    # --- 6.7: GNSS screening of the boat track ---
+    p.add_argument("--position-fill", choices=["bt", "interp", "off"], default="bt",
+                   help="6.7: what replaces a GGA fix rejected by the HDOP or the "
+                        "GGA-BT consistency filter: 'bt' (default) the bottom-track "
+                        "increments between the valid fixes on either side; 'interp' "
+                        "linear interpolation in time; 'off' no filter at all (v6.6). "
+                        "Valid fixes are never modified.")
+    p.add_argument("--gga-hdop-max", type=float, default=GGA_HDOP_MAX_DEFAULT,
+                   help=f"6.7: GGA fixes with HDOP above this are invalid "
+                        f"(default {GGA_HDOP_MAX_DEFAULT:g}, QRev; 0 = off).")
+    p.add_argument("--gga-hdop-change", type=float, default=GGA_HDOP_CHANGE_DEFAULT,
+                   help=f"6.7: then, fixes whose HDOP departs from the mean of the "
+                        f"valid ones by more than this are invalid (default "
+                        f"{GGA_HDOP_CHANGE_DEFAULT:g}; 0 = off).")
+    p.add_argument("--gga-bt-tol", type=float, default=GGA_BT_TOL_DEFAULT,
+                   help=f"6.7: a GGA fix farther than this [m] from the local trend "
+                        f"of GGA minus the bottom-track track is a jump and is "
+                        f"rebuilt (default {GGA_BT_TOL_DEFAULT:g}).")
+    p.add_argument("--gga-bt-window", type=float, default=GGA_BT_WINDOW_DEFAULT,
+                   help=f"6.7: half-window [s] of that local linear trend "
+                        f"(default {GGA_BT_WINDOW_DEFAULT:g}).")
+    p.add_argument("--s-fold-tol", type=float, default=S_FOLD_TOL_DEFAULT,
+                   help=f"6.7: QA — warn when s moves backwards more than this [m] "
+                        f"during the crossing (default {S_FOLD_TOL_DEFAULT:g}).")
+    p.add_argument("--edge-drift-tol", type=float, default=EDGE_DRIFT_TOL_DEFAULT,
+                   help=f"6.7: QA — warn when the edge ensembles of a bank (Step "
+                        f"2/4, boat meant to be still) spread more than this [m] "
+                        f"across or along the section line (default "
+                        f"{EDGE_DRIFT_TOL_DEFAULT:g}).")
     p.add_argument("--time-epoch", default="auto",
                    choices=["auto", "sontek", "unix", "datenum"],
                    help="6.2: encoding of System.Time. The ranges overlap, so "
@@ -8348,6 +9267,13 @@ def _run(runlog):
                                if pre_args.config else {})                  # 6.6
     args.orient_overrides, _orient_bad = (load_orientation_overrides(pre_args.config)
                                           if pre_args.config else ({}, []))   # 6.6
+    args.discard_rules, _disc_bad = (load_discard_rules(pre_args.config)
+                                     if pre_args.config else ({}, []))        # 6.8
+    if _disc_bad:
+        sys.exit("[error] [descartes] reglas inválidas — corregir el INI:\n  "
+                 + "\n  ".join(_disc_bad)
+                 + "\n  formato: <id> = <fuente>[+<fuente>] [s|ens|prof|cota|dif "
+                   "<A-B | <X | >X>] ...   (fuente: vb, b1..b4, bt, todos)")
     datum_name = args.datum_name
     # 6.5: distance to the river axis beyond which a GNSS water-surface point or
     # a gauge is not used (module constants read by WaterSurfaceModel and
@@ -8477,6 +9403,21 @@ def _run(runlog):
         for k in args.orient_overrides:
             if k not in stems and k not in (args.manual_groups or {}):
                 setup_log.append(f"[info] [orientacion] {k}: no es el id de una "
+                                 "transecta de entrada — se aplicará si coincide con "
+                                 "el id de un grupo")
+
+    # 6.8: [descartes]
+    if args.discard_rules:
+        nr = sum(len(v) for v in args.discard_rules.values())
+        setup_log.append(f"[info] [descartes] {nr} reglas en {len(args.discard_rules)} "
+                         "ids: " + "; ".join(
+                             f"{k}: " + ", ".join(r["text"] for r in v)
+                             for k, v in args.discard_rules.items()))
+        stems = {m.stem for m in matfiles}
+        for k in args.discard_rules:
+            if not any(_id_key_matches(k, s) for s in stems) \
+                    and k not in (args.manual_groups or {}):
+                setup_log.append(f"[info] [descartes] {k}: no es el id de una "
                                  "transecta de entrada — se aplicará si coincide con "
                                  "el id de un grupo")
 
