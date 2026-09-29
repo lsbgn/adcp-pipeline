@@ -1,4 +1,4 @@
-# process_adcp_bathimetric.py v6.7 — guía de uso
+# process_adcp_bathimetric.py v6.8 — guía de uso
 
 Extrae secciones transversales batimétricas de archivos `.mat` de SonTek RiverSurveyor (M9/S5). Genera el perfil del lecho perpendicular al flujo, georreferenciado, en progresiva oficial y en cota IGN SRVN16. No exporta velocidades.
 
@@ -41,6 +41,7 @@ Hay un ejemplo completo y comentado en `campanha_ejemplo_v6.ini`. Secciones:
 | `[orientacion]` | Forzar la sección al recorrido o a un azimut: `<id> = recorrido` o `<id> = 135` |
 | `[saltos]` | Discontinuidades del pelo de agua: `<nombre> = Neuquen \| <progresiva>` o `<nombre> = <x> <y>` |
 | `[recorridos]` | Corregir la clase de un recorrido: `<id> = longitudinal \| Neuquen` |
+| `[descartes]` | Sacar del ajuste una fuente de profundidad en todo o parte de una sección (6.8, ver apartado 7): `<id> = vb s 131.5-134.0` |
 
 Las claves desconocidas y los valores fuera de las opciones válidas se avisan o cortan la corrida; no se ignoran en silencio.
 
@@ -166,7 +167,7 @@ Las claves desconocidas y los valores fuera de las opciones válidas se avisan o
 **Por transecta o grupo** (`<salida>/<perfil>/`):
 
 - `bathymetric_profile.csv`: s, profundidad, pelo de agua, cota del lecho, coordenadas.
-- `raw_bed_points.csv`: cada huella de haz proyectada.
+- `raw_bed_points.csv`: cada huella de haz proyectada. Desde 6.8 termina en `ens` (número de ensamble de RSL) y `descarte` (la regla que lo sacó; vacío si se usó).
 - `cross_section.png` y `plan_view_map.png`.
 - `axis.shp`, `profile_points.shp`, `raw_beam_points.shp`.
 - `process_log.txt`.
@@ -201,7 +202,79 @@ En `process_log.txt` de cada perfil:
 
 **Si el filtro corrige de más** (poco probable con el autónomo del M9): subí `gga-bt-tol` a 2–3 m, o usá `interp` para confiar solo en el HDOP. Si hubo fondo móvil fuerte, la tendencia GGA − BT deriva más rápido; la ventana de 30 s lo absorbe en cruces normales. No la bajes de 20 s.
 
-## 7. Problemas frecuentes
+## 7. Descartes manuales — `[descartes]` (6.8)
+
+El filtro de picos trabaja sobre la serie de cada haz y no rechaza una tanda de varios ensambles en una barranca, porque ahí el rango intercuartil es grande. Con `[descartes]` se saca una fuente donde se sabe que está mal. El composite rellena esos nodos con la fuente secundaria, igual que QRev cuando falta la primaria.
+
+```ini
+[descartes]
+; <id> = <regla>, <regla>, ...        (o una regla por renglón, con sangría)
+; <regla> = <fuente>[+<fuente>] [<condición> <valor>] ...
+20260825153036 = vb s 131.5-134.0
+```
+
+**`<id>`**: el nombre del `.mat` sin extensión, o solo sus 14 dígitos (`20260825153036` vale para `20260825153036r`). También puede ser el id de un grupo (`<id>_x4`) o un nombre de `[grupos]`; entonces las condiciones se leen sobre el eje del grupo.
+
+**Fuentes**
+
+| Fuente | Qué saca |
+|---|---|
+| `vb` | Haz vertical |
+| `b1` … `b4` | Un haz inclinado (el número de RSL) |
+| `bt` | Los cuatro inclinados |
+| `todos` | Todos los haces |
+
+Se combinan con `+`: `vb+b1`.
+
+**Condiciones** (todas deben cumplirse; sin condición se saca la fuente en toda la sección)
+
+| Condición | Sobre qué | Ejemplo |
+|---|---|---|
+| `s` | Distancia transversal [m], como en `cross_section.png` | `s 131.5-134.0` |
+| `ens` | Número de ensamble de RSL (desde 1; columna `ens` de `raw_bed_points.csv`) | `ens 27-30`, `ens 28` |
+| `prof` | Profundidad del haz [m] | `prof <3` |
+| `cota` | Cota del punto [m]; necesita pelo de agua | `cota >249.4` |
+| `dif` | Diferencia con la otra fuente en el mismo ensamble [m]: para el VB, contra la mediana de los inclinados; para un inclinado, contra el VB | `dif >1.5` |
+
+Valores: `A-B`, `<X`, `>X` (bordes incluidos), o un número suelto para `ens`. **El separador decimal es el punto**; la coma separa reglas.
+
+**Ejemplos**
+
+```ini
+[descartes]
+; el raigón del VB en el Negro 2+018
+20260825153036 = vb s 131.5-134.0
+; lo mismo, por ensambles
+20260825153036 = vb ens 27-30
+; lo mismo, sin decir dónde: el VB que difiere más de 1.5 m de los inclinados
+20260825153036 = vb dif >1.5
+; solo lo que sube por encima de 249.4 m en ese tramo
+20260825153036 = vb cota >249.4 s 125-136
+; varias reglas en la misma transecta
+20260825153036 = vb s 131.5-134.0, b1 ens 28
+; un haz que anduvo mal en toda la sección
+20260415125906 = b4
+; en un aforo, sobre el eje del grupo
+NQ31 = vb s 40-42 prof <1.5
+```
+
+**Cómo leer los rangos.** `s` se lee en la sección **sin descartes**, o sea el `cross_section.png` que miraste para escribir la regla. Después la extensión medida se recalcula con los puntos que quedan. Si eso corre el origen de s (solo pasa si descartás los puntos de un extremo), el log lo dice.
+
+**Qué queda registrado**
+
+- `process_log.txt`: una línea por regla con cuántos puntos sacó, de qué haz, y el rango de s y de ensambles. Si una regla no coincide con ningún punto, sale un `[warn]`.
+- `cross_section.png`: los puntos descartados como cruces rojas.
+- `raw_bed_points.csv`: los descartados siguen en el archivo, con la regla en `descarte`.
+- `survey_index.csv`: columna `descartes` al final, con la cantidad de puntos (en un grupo, los de los miembros más los del grupo).
+- La nube de la campaña (`survey_raw_beam_points.shp`) no incluye los descartados.
+
+Una regla mal escrita corta la corrida al empezar, con el renglón y el motivo.
+
+**Cuidado con `dif`.** En una barranca los haces inclinados ven fondo a otra profundidad que el VB, y la diferencia es real. En el Negro 2+018, `vb dif >1.0` saca, además del raigón (ens. 27–30), dos ensambles del pie de la barranca (21–22). Conviene acotarlo con `s` o `ens`, o subir el umbral.
+
+**En aforos.** Una regla con el id de una transecta se aplica a esa repetición, y el grupo ya no usa esos puntos. Una regla con el id del grupo se aplica a la nube fusionada, sobre el eje del grupo. `ens` no vale en una regla de grupo, porque cada repetición numera sus ensambles.
+
+## 8. Problemas frecuentes
 
 | Síntoma | Qué mirar |
 |---|---|
@@ -210,18 +283,19 @@ En `process_log.txt` de cada perfil:
 | Perfil con cota relativa | `ws_source = none`: falta pelo de agua en esa progresiva |
 | La transecta cae en otro río | `[rios]` o `[ubicacion]` |
 | Sección cruzada a una obra | `[orientacion]` con `recorrido` o un azimut |
+| Un pico del VB (raigón, ramas, peces) que el filtro no saca | `[descartes]` con `vb` y el tramo (apartado 7) |
 
-## 8. Comparar dos corridas — `tools/comparar_corridas.py`
+## 9. Comparar dos corridas — `tools/comparar_corridas.py`
 
 ```powershell
-python tools\comparar_corridas.py salida_v66 salida_v67            # A = referencia, B = nueva
-python tools\comparar_corridas.py salida_v66 salida_v67 --plots all
+python tools\comparar_corridas.py salida_v67 salida_v68            # A = referencia, B = nueva
+python tools\comparar_corridas.py salida_v67 salida_v68 --plots all
 python tools\comparar_corridas.py salida_v66 salida_off --check    # regresión: exit 1 si algo cambia
 ```
 
 Escribe `<B>/_comparacion/` con:
 
-- `comparacion.csv`: una fila por perfil, ordenada del cambio más grande al más chico. Tiene el `estado`, RMS / sesgo / máx |Δz| y el s del máximo, Δancho, Δprof. máx., Δthalweg, Δpelo de agua, Δprogresiva, cuánto se movió el eje, si cambió la nube cruda y las columnas `pos_*` de la corrida B.
+- `comparacion.csv`: una fila por perfil, ordenada del cambio más grande al más chico. Tiene el `estado`, RMS / sesgo / máx |Δz| y el s del máximo, Δancho, Δprof. máx., Δthalweg, Δpelo de agua, Δprogresiva, cuánto se movió el eje, si cambió la nube cruda (`nube_igual`, sobre las 12 columnas de v6.7), cuántos puntos descartó `[descartes]` en cada corrida (`descartes_a`, `descartes_b`) y las columnas `pos_*` de la corrida B.
 - `parametros_diff.txt`: las claves con distinto valor entre los dos `procesamiento.txt`, más la versión del script de cada corrida.
 - `<perfil>.png`: lechos A (gris, a trazos) y B (negro) superpuestos, con Δz(s) abajo. Por defecto, solo para los que cambian.
 
@@ -241,4 +315,11 @@ Para cambiar parámetros, una corrida por variante y la misma referencia:
 python process_adcp_bathimetric.py --config campanha.ini --outdir salida_ref
 python process_adcp_bathimetric.py --config campanha.ini --outdir salida_tol2 --gga-bt-tol 2
 python tools\comparar_corridas.py salida_ref salida_tol2
+```
+
+Para ver qué cambia un descarte, la corrida de referencia es la misma campaña sin la regla (comentá el renglón con `;`):
+
+```powershell
+python process_adcp_bathimetric.py --config campanha.ini --outdir salida_con_descartes
+python tools\comparar_corridas.py salida_ref salida_con_descartes
 ```
